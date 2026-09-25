@@ -2191,14 +2191,15 @@ from flask import (
 )
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION & RULES
 # ============================================================
 
 DB_NAME = "aviator_live.db"
 
 BETTING_WINDOW = 5.0
 MAX_BETS = 2
-MAX_WITHDRAWAL = 250000.0
+MIN_DEPOSIT = 200.0
+MIN_WITHDRAWAL = 1000.0
 CRASH_DISPLAY_TIME = 0.5
 STARTING_BALANCE = 0.0
 
@@ -2312,7 +2313,6 @@ def generate_crash_point():
 
 
 def calculate_multiplier(elapsed):
-    # Authentic Odibet Aviator curve: starts smooth and quick, then climbs aggressively
     multiplier = 1.0 + (elapsed * 0.45) + ((elapsed ** 1.65) * 0.12)
     return round(multiplier, 2)
 
@@ -2329,25 +2329,22 @@ GAME = {
     "bot_bets": []
 }
 
-FAKE_USERS = [
-    "***1", "***2", "***3", "***4", "***5", "***6", "***7", "***8", "***9", "***0",
-    "alex***", "brian***", "coll***", "david***", "eric***", "frank***", "grace***",
-    "harr***", "ian***", "john***", "kevin***", "lucy***", "mike***", "nick***",
-    "oliver***", "peter***", "queen***", "ray***", "sam***", "tom***", "victor***",
-    "wendy***", "xav***", "yves***", "zack***", "kelv***", "sylv***", "mash***",
-    "kip***", "wanj***", "njeri***", "ochi***", "otien***", "maina***", "chep***",
-    "kiprot***", "kibet***", "kipko***", "cherot***", "jelag***", "baras***"
+FIRST_NAMES = [
+    "alex", "brian", "coll", "david", "eric", "frank", "grace", "harr", "ian", "john",
+    "kevin", "lucy", "mike", "nick", "oliver", "peter", "queen", "ray", "sam", "tom",
+    "victor", "wendy", "xav", "yves", "zack", "kelv", "sylv", "mash", "kip", "wanj",
+    "njeri", "ochi", "otien", "maina", "chep", "kiprot", "kibet", "kipko", "cherot",
+    "jelag", "baras", "mutiso", "odhi", "korir", "kipng", "chepk", "kipke", "kipch"
 ]
 
 def generate_bot_bets():
     bets = []
-    count = random.randint(55, 75)
-    selected_users = random.sample(FAKE_USERS * 2, count)
-    
-    for i, user in enumerate(selected_users):
-        masked = user[:3] + "***" + str(random.randint(0,9))
+    count = random.randint(780, 840)
+    for i in range(count):
+        prefix = random.choice(FIRST_NAMES)
+        masked = prefix[:3] + "***" + str(random.randint(0, 9))
         amount = round(random.choice([50, 100, 200, 500, 1000, 2500, 5000, 10000]), 2)
-        target_cashout = round(random.uniform(1.10, 10.00), 2) if random.random() > 0.15 else None
+        target_cashout = round(random.uniform(1.10, 15.00), 2) if random.random() > 0.12 else None
         
         bets.append({
             "id": f"bot_{i}",
@@ -2396,7 +2393,7 @@ def start_running_locked():
     GAME["current_multiplier"] = 1.00
 
 
-def process_auto_cashouts_locked():
+def process_auto_cashouts_and_bets_locked():
     if GAME["status"] != "RUNNING":
         return
 
@@ -2415,7 +2412,7 @@ def process_auto_cashouts_locked():
 
     for bot in GAME["bot_bets"]:
         if bot["status"] == "ACTIVE" and not bot["auto_cashout"] and multiplier > 1.20:
-            if random.random() < 0.04:
+            if random.random() < 0.05:
                 bot["status"] = "WON"
                 bot["cashout_multiplier"] = multiplier
                 bot["winnings"] = round(bot["amount"] * multiplier, 2)
@@ -2476,7 +2473,7 @@ def tick_game_locked():
         elapsed = now - GAME["run_start"]
         multiplier = calculate_multiplier(elapsed)
         GAME["current_multiplier"] = multiplier
-        process_auto_cashouts_locked()
+        process_auto_cashouts_and_bets_locked()
 
         if multiplier >= GAME["crash_point"]:
             crash_round_locked()
@@ -2511,6 +2508,12 @@ def get_user(username):
     return row
 
 
+def mask_username(username):
+    if len(username) <= 3:
+        return username + "***"
+    return username[:3] + "***" + str(len(username))
+
+
 def add_balance(username, amount):
     conn = get_db()
     conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount, username))
@@ -2541,7 +2544,7 @@ def place_bet_for_user(username, bet_number, amount, auto_cashout):
         if bet_number not in [1, 2]:
             return False, "Invalid bet slot."
         if GAME["status"] != "BETTING":
-            return False, "Betting closed for this round."
+            return False, "Betting closed for this round. Wait for next round."
 
         try:
             amount = float(amount)
@@ -2567,7 +2570,7 @@ def place_bet_for_user(username, bet_number, amount, auto_cashout):
             existing = conn.execute("SELECT id FROM bets WHERE username = ? AND round_id = ? AND bet_number = ?", (username, GAME["round_id"], bet_number)).fetchone()
             if existing:
                 conn.rollback()
-                return False, f"Bet {bet_number} already placed."
+                return False, f"Bet {bet_number} already placed for this round."
 
             user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
             if not user or float(user["balance"]) < amount:
@@ -2580,7 +2583,7 @@ def place_bet_for_user(username, bet_number, amount, auto_cashout):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (username, GAME["round_id"], bet_number, amount, auto_cashout, 0.0, "ACTIVE", datetime.now().isoformat()))
             conn.commit()
-            return True, f"Bet {bet_number} placed successfully."
+            return True, f"Bet {bet_number} placed successfully!"
         except Exception:
             conn.rollback()
             return False, "Failed to place bet."
@@ -2672,7 +2675,7 @@ def forgot_password():
                 success = f"Verification code sent to {phone}. (Simulation Code: {code})"
                 step = "verify"
             else:
-                error = "Phone number not found in our records."
+                error = "Phone number not found in records."
             conn.close()
 
         elif step == "verify":
@@ -2744,9 +2747,10 @@ def api_state():
         username = session["username"]
         user = get_user(username)
         isAdmin = (user["role"] == "ADMIN")
+        masked_self = mask_username(username)
 
         conn = get_db()
-        history_rows = conn.execute("SELECT crash_point FROM rounds WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 20").fetchall()
+        history_rows = conn.execute("SELECT crash_point FROM rounds WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 25").fetchall()
         history = [float(r["crash_point"]) for r in history_rows][::-1]
 
         bet_rows = conn.execute("SELECT bet_number, amount, auto_cashout, cashout_multiplier, winnings, status FROM bets WHERE username = ? AND round_id = ?", (username, GAME["round_id"])).fetchall()
@@ -2755,22 +2759,21 @@ def api_state():
         user_bets = {}
         all_live_bets = []
 
-        for b in GAME["bot_bets"]:
-            all_live_bets.append(b)
-
         for r in bet_rows:
             user_bets[str(r["bet_number"])] = dict(r)
             all_live_bets.append({
                 "id": f"real_{r['bet_number']}",
-                "username": username + " (You)",
+                "username": masked_self + " (You)",
                 "amount": r["amount"],
                 "auto_cashout": r["auto_cashout"],
                 "status": r["status"],
                 "cashout_multiplier": r["cashout_multiplier"],
-                "winnings": r["winnings"]
+                "winnings": r["winnings"],
+                "is_self": True
             })
 
-        all_live_bets.sort(key=lambda x: 0 if x["status"] == "ACTIVE" else 1)
+        for b in GAME["bot_bets"]:
+            all_live_bets.append(b)
 
         return jsonify({
             "status": GAME["status"],
@@ -2791,7 +2794,12 @@ def api_bet():
     if "username" not in session:
         return jsonify({"success": False, "message": "Unauthorized"}), 401
     data = request.get_json() or {}
-    success, msg = place_bet_for_user(session["username"], int(data.get("bet_number", 1)), data.get("amount", 0), data.get("auto_cashout"))
+    success, msg = place_bet_for_user(
+        session["username"],
+        int(data.get("bet_number", 1)),
+        data.get("amount", 0),
+        data.get("auto_cashout")
+    )
     return jsonify({"success": success, "message": msg})
 
 
@@ -2813,10 +2821,12 @@ def api_confirm_deposit():
         amount = float(data.get("amount", 0))
     except ValueError:
         return jsonify({"success": False, "message": "Invalid amount."})
-    if amount <= 0:
-        return jsonify({"success": False, "message": "Amount must be greater than zero."})
+    
+    if amount < MIN_DEPOSIT:
+        return jsonify({"success": False, "message": f"Minimum deposit amount is KSh {MIN_DEPOSIT:,.2f}."})
+    
     add_balance(session["username"], amount)
-    return jsonify({"success": True, "message": f"Successfully credited KSh {amount:,.2f}!"})
+    return jsonify({"success": True, "message": f"Successfully deposited KSh {amount:,.2f} via M-Pesa!"})
 
 
 @app.route("/api/withdraw", methods=["POST"])
@@ -2829,17 +2839,21 @@ def api_withdraw():
     except ValueError:
         return jsonify({"success": False, "message": "Invalid amount."})
     
+    if amount < MIN_WITHDRAWAL:
+        return jsonify({"success": False, "message": f"Minimum withdrawal amount is KSh {MIN_WITHDRAWAL:,.2f}."})
+    
     username = session["username"]
     user = get_user(username)
     if user["balance"] < amount:
-        return jsonify({"success": False, "message": "Insufficient balance."})
+        return jsonify({"success": False, "message": "Insufficient balance for this withdrawal."})
+    
     if deduct_balance(username, amount):
-        return jsonify({"success": True, "message": f"Withdrawal of KSh {amount:,.2f} processed to registered number {user['phone_number']}."})
+        return jsonify({"success": True, "message": f"Withdrawal request of KSh {amount:,.2f} sent to {user['phone_number']}. Processing via M-Pesa..."})
     return jsonify({"success": False, "message": "Withdrawal failed."})
 
 
 # ============================================================
-# TEMPLATES (EXACT ODI CASINO AVIATOR LAYOUT & STYLING)
+# TEMPLATES (RESPONSIVE LAYOUT FOR MOBILE & DESKTOP)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -2968,12 +2982,53 @@ HTML = r"""
 * { box-sizing:border-box; }
 body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#0f0f0f; color:#fff; display:flex; justify-content:center; }
 
-.app-wrapper { width:100%; max-width:440px; background:#160404; min-height:100vh; display:flex; flex-direction:column; border-left:1px solid #331010; border-right:1px solid #331010; }
+/* Responsive Main Shell Wrapper */
+.app-wrapper { 
+    width:100%; 
+    max-width:480px; 
+    background:#160404; 
+    min-height:100vh; 
+    display:flex; 
+    flex-direction:column; 
+    border-left:1px solid #331010; 
+    border-right:1px solid #331010; 
+    position:relative; 
+    transition: all 0.3s ease;
+}
+
+/* Desktop Expansion Override */
+@media (min-width: 900px) {
+    body { background: #080202; align-items: center; padding: 20px 0; }
+    .app-wrapper { max-width: 1100px; border: 1px solid #4a1515; border-radius: 16px; overflow: hidden; box-shadow: 0 15px 40px rgba(0,0,0,0.9); min-height: 850px; display: grid; grid-template-columns: 280px 1fr 340px; grid-template-rows: auto auto 1fr; }
+    
+    .top-header { grid-column: 1 / -1; }
+    .aviator-subbar { grid-column: 1 / -1; }
+    .history-bar { grid-column: 1 / -1; }
+    
+    /* Desktop Sidebar Menu (Always visible on desktop) */
+    .menu-drawer { position: relative !important; left: 0 !important; width: 100% !important; height: 100% !important; box-shadow: none !important; border-right: 1px solid #3a1010 !important; grid-row: 4 / 6; }
+    .menu-header button { display: none !important; }
+    
+    /* Center Game Stage */
+    .center-stage { grid-column: 2; grid-row: 4; display: flex; flex-direction: column; }
+    .aviator-screen { height: 360px !important; }
+    .betting-container { flex-direction: row !important; gap: 12px; }
+    .bet-card { flex: 1; }
+
+    /* Right Sidebar Live Feed on Desktop */
+    .live-feed-section { grid-column: 3; grid-row: 4; max-height: 100% !important; border-left: 1px solid #3a1010; border-top: none !important; }
+    .desktop-hide { display: none !important; }
+}
+
+@media (max-width: 899px) {
+    .desktop-only-sidebar { display: none !important; }
+    .center-stage { display: flex; flex-direction: column; width: 100%; }
+}
 
 /* Top Header Bar */
-.top-header { display:flex; justify-content:space-between; align-items:center; background:#1c0707; padding:10px 14px; border-bottom:1px solid #3a1010; }
+.top-header { display:flex; justify-content:space-between; align-items:center; background:#1c0707; padding:12px 16px; border-bottom:1px solid #3a1010; }
 .top-left { display:flex; align-items:center; gap:12px; }
-.close-btn { background:none; border:none; color:#aaa; font-size:18px; cursor:pointer; }
+.menu-btn { background:none; border:none; color:#fff; font-size:22px; cursor:pointer; }
 .odi-logo { text-align:center; line-height:1; }
 .odi-txt { font-size:10px; font-weight:bold; color:#fff; letter-spacing:1px; }
 .casino-txt { font-size:14px; font-weight:900; color:#ef4444; letter-spacing:1.5px; font-style:italic; }
@@ -2982,34 +3037,51 @@ body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Robo
 .chat-btn { background:#240c0c; border:1px solid #451515; color:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; font-size:14px; }
 
 /* Sub Header Aviator bar */
-.aviator-subbar { display:flex; justify-content:space-between; align-items:center; padding:8px 14px; background:#1a0707; border-bottom:1px solid #3a1010; font-size:13px; }
+.aviator-subbar { display:flex; justify-content:space-between; align-items:center; padding:10px 16px; background:#1a0707; border-bottom:1px solid #3a1010; font-size:13px; }
 .subbar-left { display:flex; align-items:center; gap:8px; }
 .aviator-logo-txt { font-size:16px; font-weight:900; color:#ef4444; font-style:italic; }
-.balance-display { color:#facc15; font-weight:bold; }
+.balance-display { color:#facc15; font-weight:bold; font-size:15px; }
 
 /* History Bar */
-.history-bar { display:flex; gap:6px; background:#1c0707; padding:6px 10px; overflow-x:auto; border-bottom:1px solid #3a1010; }
-.pill-green { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; background:rgba(34,197,94,0.2); color:#22c55e; border:1px solid #22c55e; white-space:nowrap; }
-.pill-red { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; background:rgba(239,68,68,0.2); color:#ef4444; border:1px solid #ef4444; white-space:nowrap; }
+.history-bar { display:flex; gap:6px; background:#1c0707; padding:8px 14px; overflow-x:auto; border-bottom:1px solid #3a1010; }
+.pill-green { padding:3px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(34,197,94,0.2); color:#22c55e; border:1px solid #22c55e; white-space:nowrap; }
+.pill-red { padding:3px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(239,68,68,0.2); color:#ef4444; border:1px solid #ef4444; white-space:nowrap; }
 
 /* Game Screen */
 .aviator-screen { position:relative; height:250px; background:radial-gradient(circle at center, #691515 0%, #2b0606 65%, #160202 100%); border-bottom:2px solid #5a1515; display:flex; flex-direction:column; justify-content:center; align-items:center; overflow:hidden; }
-.multiplier-display { font-size:52px; font-weight:900; color:#fff; text-shadow:0 0 20px rgba(239,68,68,0.8); z-index:10; text-align:center; }
-.status-msg { font-size:13px; color:#eab308; font-weight:bold; z-index:10; margin-top:2px; }
+.multiplier-display { font-size:56px; font-weight:900; color:#fff; text-shadow:0 0 25px rgba(239,68,68,0.8); z-index:10; text-align:center; }
+.status-msg { font-size:14px; color:#eab308; font-weight:bold; z-index:10; margin-top:4px; }
 
 svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
-.plane-icon { position: absolute; font-size: 34px; z-index: 5; pointer-events: none; transform: translate(-30%, -70%) rotate(-12deg); filter: drop-shadow(0 0 10px rgba(239,68,68,0.9)); display: none; }
+.plane-icon { position: absolute; font-size: 38px; z-index: 5; pointer-events: none; transform: translate(-30%, -70%) rotate(-12deg); filter: drop-shadow(0 0 10px rgba(239,68,68,0.9)); display: none; }
+
+/* Mobile Side Menu Drawer */
+.menu-drawer { position: absolute; top: 0; left: -280px; width: 280px; height: 100%; background: #1c0707; z-index: 100; transition: left 0.3s ease; border-right: 2px solid #5a1515; box-shadow: 5px 0 25px rgba(0,0,0,0.8); display: flex; flex-direction: column; }
+.menu-drawer.open { left: 0; }
+.menu-header { background: #2c0c0c; padding: 18px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #5a1515; }
+.menu-items { padding: 10px 0; flex: 1; }
+.menu-item { padding: 15px 20px; font-size: 15px; font-weight: bold; color: #d1d5db; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 12px; }
+.menu-item:hover { background: #3a1010; color: #facc15; }
+
+/* Live Feed Section (800+ Users) */
+.live-feed-section { background:#1c0707; border-top:1px solid #3a1010; padding:12px; max-height:260px; overflow-y:auto; }
+.feed-header { font-size:12px; font-weight:bold; color:#eab308; margin-bottom:8px; display:flex; justify-content:space-between; }
+.feed-item { display:flex; justify-content:space-between; align-items:center; padding:6px 10px; border-bottom:1px solid rgba(255,255,255,0.03); font-size:12px; }
+.feed-item.self { background:rgba(234, 179, 8, 0.15); border-left:3px solid #eab308; }
 
 /* Betting Panels Container */
-.betting-container { padding:10px; display:flex; flex-direction:column; gap:10px; background:#160404; flex:1; overflow-y:auto; }
+.betting-container { padding:12px; display:flex; flex-direction:column; gap:12px; background:#160404; flex:1; }
 
-.bet-card { background:#1c0707; border:1px solid #3a1010; border-radius:12px; padding:12px; }
+.bet-card { background:#1c0707; border:1px solid #3a1010; border-radius:12px; padding:14px; }
 .bet-tabs { display:flex; background:#120303; border-radius:8px; padding:3px; margin-bottom:10px; }
 .bet-tab { flex:1; text-align:center; padding:6px; font-size:12px; font-weight:bold; color:#888; border-radius:6px; cursor:pointer; }
 .bet-tab.active { background:#2c0c0c; color:#fff; }
 
-.amount-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
-.amt-btn { background:#2c0c0c; border:1px solid #4a1515; color:#fff; width:36px; height:36px; border-radius:50%; font-size:18px; font-weight:bold; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+.auto-box { display:none; margin-bottom:10px; font-size:12px; color:#9ca3af; }
+.auto-box.active { display:block; }
+
+.amount-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.amt-btn { background:#2c0c0c; border:1px solid #4a1515; color:#fff; width:38px; height:38px; border-radius:50%; font-size:18px; font-weight:bold; cursor:pointer; display:flex; align-items:center; justify-content:center; }
 .amt-value { font-size:20px; font-weight:900; color:#fff; letter-spacing:1px; }
 
 .quick-stakes { display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; margin-bottom:12px; }
@@ -3023,105 +3095,154 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
 .admin-banner { background:#7f1d1d; border:1px solid #ef4444; padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; font-weight:bold; color:#fca5a5; font-size:12px; margin:10px; }
 .admin-val { color:#fff; font-size:15px; }
 
-.logout-bar { text-align:center; padding:10px; font-size:12px; }
-.logout-bar a { color:#ef4444; text-decoration:none; font-weight:bold; }
+/* Modal overlay */
+.modal-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:200; display:none; justify-content:center; align-items:center; padding:20px; }
+.modal-content { background:#240808; border:1px solid #5a1515; padding:24px; border-radius:12px; width:100%; max-width:380px; box-sizing:border-box; }
+.modal-content h3 { color:#eab308; margin-top:0; }
+.modal-content input { width:100%; padding:12px; margin:10px 0; background:#160404; border:1px solid #5a1515; color:#fff; border-radius:6px; box-sizing:border-box; font-size:15px; }
+.modal-btns { display:flex; gap:10px; margin-top:10px; }
+.modal-btns button { flex:1; padding:12px; border:none; border-radius:6px; font-weight:bold; cursor:pointer; font-size:15px; }
 </style>
 </head>
 <body>
 
 <div class="app-wrapper">
+    <!-- Mobile Side Menu Drawer -->
+    <div class="menu-drawer desktop-only-sidebar" id="menuDrawer">
+        <div class="menu-header">
+            <span style="font-weight:bold; color:#eab308; font-size:16px;">Odi Menu</span>
+            <button class="desktop-hide" onclick="toggleMenu()" style="background:none; border:none; color:#fff; font-size:18px; cursor:pointer;">✕</button>
+        </div>
+        <div class="menu-items">
+            <div class="menu-item" onclick="openDepositModal()">💳 Deposit (Min. 200 KES)</div>
+            <div class="menu-item" onclick="openWithdrawModal()">💸 Withdraw (Min. 1,000 KES)</div>
+            <div class="menu-item" onclick="alert('Username: {{ username }}\nAccount Status: Active');">👤 My Profile</div>
+            <div class="menu-item" onclick="alert('Aviator is a multiplayer crash game where the multiplier increases as the plane flies. Cash out before it flies away!');">📖 How to Play</div>
+            <div class="menu-item" onclick="window.location.href='/logout'" style="color:#ef4444;">🚪 Logout</div>
+        </div>
+    </div>
+
     <!-- Top Header -->
     <div class="top-header">
         <div class="top-left">
-            <button class="close-btn" onclick="window.location.href='/logout'">✕</button>
+            <button class="menu-btn desktop-hide" onclick="toggleMenu()">☰</button>
             <div class="odi-logo">
                 <div class="odi-txt">odi</div>
                 <div class="casino-txt">CASINO</div>
             </div>
         </div>
-        <div style="display:flex; gap:8px; align-items:center;">
+        <div style="display:flex; gap:10px; align-items:center;">
             <button class="deposit-btn" onclick="openDepositModal()">Deposit</button>
             <button class="chat-btn" id="soundToggle" onclick="toggleSound()">🔊</button>
         </div>
     </div>
 
-    <!-- Aviator Bar -->
-    <div class="aviator-subbar">
-        <div class="subbar-left">
-            <span class="aviator-logo-txt">Aviator</span>
+    <!-- Center Stage (Game + Betting Controls) -->
+    <div class="center-stage">
+        <!-- Aviator Bar -->
+        <div class="aviator-subbar">
+            <div class="subbar-left">
+                <span class="aviator-logo-txt">Aviator</span>
+            </div>
+            <div>
+                <span class="balance-display" id="lblBalance">0.00 KES</span>
+            </div>
         </div>
-        <div>
-            <span class="balance-display" id="lblBalance">0.00 KES</span>
+
+        <!-- History Bar -->
+        <div class="history-bar" id="historyBar"></div>
+
+        <!-- Admin Panel -->
+        <div id="adminPanel" class="admin-banner" style="display:none;">
+            <span>ADMIN PREVIEW:</span>
+            <span class="admin-val" id="lblNextCrash">--</span>
+        </div>
+
+        <!-- Game Screen -->
+        <div class="aviator-screen" id="aviatorScreen">
+            <svg class="flight-path" id="flightSvg" viewBox="0 0 400 250" preserveAspectRatio="none">
+                <path id="areaPath" d="M 0 250 L 0 250 L 400 250 Z" fill="rgba(239, 68, 68, 0.2)" />
+                <path id="curvePath" d="M 0 250 L 0 250" fill="none" stroke="#ef4444" stroke-width="5" stroke-linecap="round" />
+            </svg>
+            <div class="plane-icon" id="planeIcon">✈️</div>
+            
+            <div class="multiplier-display" id="lblMultiplier">1.00x</div>
+            <div class="status-msg" id="lblStatusMsg">Waiting for next round...</div>
+        </div>
+
+        <!-- Betting Controls -->
+        <div class="betting-container">
+            <!-- Bet 1 -->
+            <div class="bet-card">
+                <div class="bet-tabs">
+                    <div class="bet-tab active" id="tab1_bet" onclick="switchTab(1, 'bet')">Bet</div>
+                    <div class="bet-tab" id="tab1_auto" onclick="switchTab(1, 'auto')">Auto</div>
+                </div>
+                <div class="auto-box" id="autoBox1">
+                    <label>Auto Cashout Multiplier</label>
+                    <input type="number" id="autoCashout1" step="0.1" value="2.00" min="1.01" style="width:100%; padding:8px; margin-top:4px; background:#160404; border:1px solid #5a1515; color:#fff; border-radius:4px;">
+                </div>
+                <div class="amount-row">
+                    <button class="amt-btn" onclick="adjustAmount(1, -50)">-</button>
+                    <div class="amt-value"><input type="number" id="betAmount1" value="200.00" step="50" style="background:transparent; border:none; color:#fff; font-size:20px; font-weight:900; width:110px; text-align:center;"></div>
+                    <button class="amt-btn" onclick="adjustAmount(1, 50)">+</button>
+                </div>
+                <div class="quick-stakes">
+                    <div class="quick-btn" onclick="setAmount(1, 200)">200</div>
+                    <div class="quick-btn" onclick="setAmount(1, 500)">500</div>
+                    <div class="quick-btn" onclick="setAmount(1, 1000)">1,000</div>
+                    <div class="quick-btn" onclick="setAmount(1, 5000)">5,000</div>
+                </div>
+                <button class="action-btn" id="btnAction1" onclick="handleBet(1)">Bet 200.00 KES</button>
+            </div>
+
+            <!-- Bet 2 -->
+            <div class="bet-card">
+                <div class="bet-tabs">
+                    <div class="bet-tab active" id="tab2_bet" onclick="switchTab(2, 'bet')">Bet</div>
+                    <div class="bet-tab" id="tab2_auto" onclick="switchTab(2, 'auto')">Auto</div>
+                </div>
+                <div class="auto-box" id="autoBox2">
+                    <label>Auto Cashout Multiplier</label>
+                    <input type="number" id="autoCashout2" step="0.1" value="5.00" min="1.01" style="width:100%; padding:8px; margin-top:4px; background:#160404; border:1px solid #5a1515; color:#fff; border-radius:4px;">
+                </div>
+                <div class="amount-row">
+                    <button class="amt-btn" onclick="adjustAmount(2, -50)">-</button>
+                    <div class="amt-value"><input type="number" id="betAmount2" value="200.00" step="50" style="background:transparent; border:none; color:#fff; font-size:20px; font-weight:900; width:110px; text-align:center;"></div>
+                    <button class="amt-btn" onclick="adjustAmount(2, 50)">+</button>
+                </div>
+                <div class="quick-stakes">
+                    <div class="quick-btn" onclick="setAmount(2, 200)">200</div>
+                    <div class="quick-btn" onclick="setAmount(2, 500)">500</div>
+                    <div class="quick-btn" onclick="setAmount(2, 1000)">1,000</div>
+                    <div class="quick-btn" onclick="setAmount(2, 5000)">5,000</div>
+                </div>
+                <button class="action-btn" id="btnAction2" onclick="handleBet(2)">Bet 200.00 KES</button>
+            </div>
         </div>
     </div>
 
-    <!-- History Bar -->
-    <div class="history-bar" id="historyBar"></div>
-
-    <!-- Admin Panel -->
-    <div id="adminPanel" class="admin-banner" style="display:none;">
-        <span>ADMIN PREVIEW:</span>
-        <span class="admin-val" id="lblNextCrash">--</span>
-    </div>
-
-    <!-- Game Screen -->
-    <div class="aviator-screen" id="aviatorScreen">
-        <svg class="flight-path" id="flightSvg" viewBox="0 0 400 250" preserveAspectRatio="none">
-            <!-- Transparent fill under path mimicking red gradient trace -->
-            <path id="areaPath" d="M 0 250 L 0 250 L 400 250 Z" fill="rgba(239, 68, 68, 0.2)" />
-            <!-- Solid glowing flight trajectory line -->
-            <path id="curvePath" d="M 0 250 L 0 250" fill="none" stroke="#ef4444" stroke-width="5" stroke-linecap="round" />
-        </svg>
-        <div class="plane-icon" id="planeIcon">✈️</div>
-        
-        <div class="multiplier-display" id="lblMultiplier">1.00x</div>
-        <div class="status-msg" id="lblStatusMsg">Waiting for next round...</div>
-    </div>
-
-    <!-- Betting Controls -->
-    <div class="betting-container">
-        <!-- Bet 1 -->
-        <div class="bet-card">
-            <div class="bet-tabs">
-                <div class="bet-tab active">Bet</div>
-                <div class="bet-tab" onclick="toggleAuto(1)">Auto</div>
-            </div>
-            <div class="amount-row">
-                <button class="amt-btn" onclick="adjustAmount(1, -10)">-</button>
-                <div class="amt-value"><input type="number" id="betAmount1" value="20.00" step="10" style="background:transparent; border:none; color:#fff; font-size:20px; font-weight:900; width:100px; text-align:center;"></div>
-                <button class="amt-btn" onclick="adjustAmount(1, 10)">+</button>
-            </div>
-            <div class="quick-stakes">
-                <div class="quick-btn" onclick="setAmount(1, 100)">100</div>
-                <div class="quick-btn" onclick="setAmount(1, 200)">200</div>
-                <div class="quick-btn" onclick="setAmount(1, 500)">500</div>
-                <div class="quick-btn" onclick="setAmount(1, 10000)">10,000</div>
-            </div>
-            <button class="action-btn" id="btnAction1" onclick="handleBet(1)">Bet 20.00 KES</button>
+    <!-- Live Active Users Feed (800+ Users) -->
+    <div class="live-feed-section">
+        <div class="feed-header">
+            <span>LIVE ACTIVE USERS (~820)</span>
+            <span id="activeBetsCount">Bets: 0</span>
         </div>
+        <div id="liveFeedList"></div>
+    </div>
+</div>
 
-        <!-- Bet 2 -->
-        <div class="bet-card">
-            <div class="bet-tabs">
-                <div class="bet-tab active">Bet</div>
-                <div class="bet-tab" onclick="toggleAuto(2)">Auto</div>
-            </div>
-            <div class="amount-row">
-                <button class="amt-btn" onclick="adjustAmount(2, -10)">-</button>
-                <div class="amt-value"><input type="number" id="betAmount2" value="20.00" step="10" style="background:transparent; border:none; color:#fff; font-size:20px; font-weight:900; width:100px; text-align:center;"></div>
-                <button class="amt-btn" onclick="adjustAmount(2, 10)">+</button>
-            </div>
-            <div class="quick-stakes">
-                <div class="quick-btn" onclick="setAmount(2, 100)">100</div>
-                <div class="quick-btn" onclick="setAmount(2, 200)">200</div>
-                <div class="quick-btn" onclick="setAmount(2, 500)">500</div>
-                <div class="quick-btn" onclick="setAmount(2, 10000)">10,000</div>
-            </div>
-            <button class="action-btn" id="btnAction2" onclick="handleBet(2)">Bet 20.00 KES</button>
-        </div>
-        
-        <div class="logout-bar">
-            <span>Player: <b>{{ username }}</b> | </span><a href="/logout">Logout</a>
+<!-- Modal Dialog for Deposit / Withdraw -->
+<div class="modal-overlay" id="walletModal">
+    <div class="modal-content">
+        <h3 id="modalTitle">Deposit Funds</h3>
+        <p id="modalDesc" style="font-size:13px; color:#aaa;">Enter your payment prompt link or M-Pesa number:</p>
+        <input type="text" id="modalInputLink" placeholder="Paste link or phone 2547XXXXXXXX">
+        <label style="font-size:12px; color:#aaa;">Amount (KES):</label>
+        <input type="number" id="modalInputAmount" value="500" min="1">
+        <div class="modal-btns">
+            <button onclick="closeModal()" style="background:#444; color:#fff;">Cancel</button>
+            <button onclick="submitModalAction()" style="background:#22c55e; color:#fff;">Confirm</button>
         </div>
     </div>
 </div>
@@ -3131,6 +3252,8 @@ let gameState = "BETTING";
 let userBets = {};
 let soundEnabled = true;
 let audioCtx = null;
+let modalType = 'deposit';
+let autoModes = {1: false, 2: false};
 
 function initAudio() {
     if(!audioCtx) {
@@ -3138,7 +3261,6 @@ function initAudio() {
     }
 }
 
-// Authentic Odibet Aviator Sound Effects
 function playOdibetTakeoffSound() {
     if(!soundEnabled) return;
     try {
@@ -3209,6 +3331,31 @@ function toggleSound() {
     btn.innerText = soundEnabled ? "🔊" : "🔇";
 }
 
+function toggleMenu() {
+    let drawer = document.getElementById("menuDrawer");
+    if(window.innerWidth < 900) {
+        drawer.classList.toggle("open");
+    }
+}
+
+function switchTab(slot, mode) {
+    let tabBet = document.getElementById(`tab${slot}_bet`);
+    let tabAuto = document.getElementById(`tab${slot}_auto`);
+    let autoBox = document.getElementById(`autoBox${slot}`);
+    
+    if(mode === 'bet') {
+        tabBet.classList.add("active");
+        tabAuto.classList.remove("active");
+        autoBox.classList.remove("active");
+        autoModes[slot] = false;
+    } else {
+        tabAuto.classList.add("active");
+        tabBet.classList.remove("active");
+        autoBox.classList.add("active");
+        autoModes[slot] = true;
+    }
+}
+
 function setAmount(slot, val) {
     document.getElementById("betAmount" + slot).value = val.toFixed(2);
     updateButtonLabels();
@@ -3217,7 +3364,7 @@ function setAmount(slot, val) {
 function adjustAmount(slot, delta) {
     let inp = document.getElementById("betAmount" + slot);
     let cur = parseFloat(inp.value) || 0;
-    let nxt = Math.max(1, cur + delta);
+    let nxt = Math.max(50, cur + delta);
     inp.value = nxt.toFixed(2);
     updateButtonLabels();
 }
@@ -3232,6 +3379,61 @@ function updateButtonLabels() {
                 btn.innerText = `Bet ${parseFloat(amt).toFixed(2)} KES`;
             }
         }
+    }
+}
+
+function openDepositModal() {
+    modalType = 'deposit';
+    document.getElementById("modalTitle").innerText = "Deposit Funds (Min 200 KES)";
+    document.getElementById("modalDesc").innerText = "Paste M-Pesa link or phone number:";
+    document.getElementById("modalInputAmount").value = "500";
+    document.getElementById("walletModal").style.display = "flex";
+    if(window.innerWidth < 900) {
+        document.getElementById("menuDrawer").classList.remove("open");
+    }
+}
+
+function openWithdrawModal() {
+    modalType = 'withdraw';
+    document.getElementById("modalTitle").innerText = "Withdraw Funds (Min 1,000 KES)";
+    document.getElementById("modalDesc").innerText = "Enter your M-Pesa phone number for payout:";
+    document.getElementById("modalInputAmount").value = "1000";
+    document.getElementById("walletModal").style.display = "flex";
+    if(window.innerWidth < 900) {
+        document.getElementById("menuDrawer").classList.remove("open");
+    }
+}
+
+function closeModal() {
+    document.getElementById("walletModal").style.display = "none";
+}
+
+async function submitModalAction() {
+    let amount = parseFloat(document.getElementById("modalInputAmount").value) || 0;
+    let linkOrPhone = document.getElementById("modalInputLink").value;
+    
+    if(modalType === 'deposit') {
+        if(amount < 200) { alert("Minimum deposit is KSh 200."); return; }
+        let res = await fetch('/api/confirm-deposit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({amount: amount, link: linkOrPhone})
+        });
+        let d = await res.json();
+        alert(d.message);
+        if(d.success) closeModal();
+        fetchState();
+    } else {
+        if(amount < 1000) { alert("Minimum withdrawal is KSh 1,000."); return; }
+        let res = await fetch('/api/withdraw', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({amount: amount, phone: linkOrPhone})
+        });
+        let d = await res.json();
+        alert(d.message);
+        if(d.success) closeModal();
+        fetchState();
     }
 }
 
@@ -3259,6 +3461,25 @@ async function fetchState() {
         });
         document.getElementById("historyBar").innerHTML = histHtml;
 
+        let feedHtml = "";
+        let feed = data.live_feed || [];
+        document.getElementById("activeBetsCount").innerText = `Total: ${feed.length}`;
+        
+        feed.forEach(bet => {
+            let statusBadge = "";
+            let rowClass = bet.is_self ? "feed-item self" : "feed-item";
+            
+            if(bet.status === "ACTIVE") {
+                statusBadge = `<span style="color:#eab308;">In Game</span>`;
+            } else if(bet.status === "WON") {
+                statusBadge = `<span style="color:#22c55e; font-weight:bold;">${bet.cashout_multiplier.toFixed(2)}x (+${bet.winnings.toLocaleString()})</span>`;
+            } else {
+                statusBadge = `<span style="color:#ef4444;">Crashed</span>`;
+            }
+            feedHtml += `<div class="${rowClass}"><span><b>${bet.username}</b> (KSh ${bet.amount.toLocaleString()})</span>${statusBadge}</div>`;
+        });
+        document.getElementById("liveFeedList").innerHTML = feedHtml;
+
         let planeEl = document.getElementById("planeIcon");
         let curvePath = document.getElementById("curvePath");
         let areaPath = document.getElementById("areaPath");
@@ -3274,11 +3495,10 @@ async function fetchState() {
             
             planeEl.style.display = "block";
             
-            // Exact Odibet progression mapping
             let progress = Math.min((data.multiplier - 1.0) / 5.0, 1.0);
             let svgW = 400, svgH = 250;
             let targetX = 30 + (progress * 340);
-            let targetY = 230 - (progress * 190);
+            let targetY = 240 - (progress * 200);
             
             let pathString = `M 0 250 Q ${targetX * 0.5} ${250 - (targetY * 0.1)}, ${targetX} ${targetY}`;
             curvePath.setAttribute("d", pathString);
@@ -3358,27 +3578,18 @@ async function handleBet(betNum) {
         alert(d.message);
     } else {
         let amt = document.getElementById("betAmount" + betNum).value;
+        let autoVal = autoModes[betNum] ? document.getElementById("autoCashout" + betNum).value : null;
+        
         let res = await fetch('/api/bet', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({bet_number: betNum, amount: amt, auto_cashout: null})
+            body: JSON.stringify({bet_number: betNum, amount: amt, auto_cashout: autoVal})
         });
         let d = await res.json();
         if(d.success) playOdibetTakeoffSound();
         alert(d.message);
     }
     fetchState();
-}
-
-function openDepositModal() {
-    let amt = prompt("Enter deposit amount in KES:", "1000");
-    if(amt && !isNaN(amt) && parseFloat(amt) > 0) {
-        fetch('/api/confirm-deposit', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({amount: parseFloat(amt)})
-        }).then(r => r.json()).then(d => { alert(d.message); fetchState(); });
-    }
 }
 
 setInterval(fetchState, 75);
