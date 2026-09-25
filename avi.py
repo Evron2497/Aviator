@@ -1128,7 +1128,6 @@ def generate_crash_point():
 
 
 def calculate_multiplier(elapsed):
-    # Ultra-fast Odibet climbing progression
     multiplier = 1.0 + (elapsed * 0.65) + ((elapsed ** 1.42) * 0.15)
     return round(multiplier, 2)
 
@@ -1655,7 +1654,7 @@ def api_withdraw():
 
 
 # ============================================================
-# TEMPLATES (ORIGINAL AVIATOR AUDIO + PRESERVED COLOR THEME)
+# TEMPLATES (ODIBET AVIATOR THEME + ACCURATE AUDIO & ANIMATION)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -1804,7 +1803,7 @@ body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Robo
 .status-msg { font-size:16px; color:#eab308; font-weight:bold; margin-top:5px; z-index:10; }
 
 svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
-.plane-icon { position: absolute; font-size: 38px; z-index: 5; pointer-events: none; transform: translate(-50%, 50%); filter: drop-shadow(0 0 12px rgba(255,255,255,0.8)); display: none; }
+.plane-icon { position: absolute; font-size: 42px; z-index: 5; pointer-events: none; transform: translate(-50%, 50%) rotate(-10deg); filter: drop-shadow(0 0 14px rgba(239,68,68,0.9)); display: none; transition: transform 0.1s linear; }
 
 .admin-banner { background:#7f1d1d; border:1px solid #ef4444; padding:10px 15px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; font-weight:bold; color:#fca5a5; flex-wrap:wrap; gap:5px; }
 .admin-val { color:#fff; font-size:18px; }
@@ -1909,29 +1908,29 @@ function initAudio() {
     }
 }
 
-// True Original Aviator Game Sound Synthesizers
-function playAviatorTakeoffSound() {
+// Spribe & Odibet Authentic Audio Synthesis Engine
+function playOdibetTakeoffSound() {
     if(!soundEnabled) return;
     try {
         initAudio();
-        // Authentic rising turbine sound generator
+        let now = audioCtx.currentTime;
         let osc = audioCtx.createOscillator();
         let gain = audioCtx.createGain();
-        osc.type = "triangle";
-        osc.frequency.setValueAtTime(100, audioCtx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(850, audioCtx.currentTime + 1.5);
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(90, now);
+        osc.frequency.exponentialRampToValueAtTime(700, now + 1.2);
         
-        gain.gain.setValueAtTime(0.18, audioCtx.currentTime);
-        gain.gain.linearRampToValueAtTime(0.0001, audioCtx.currentTime + 1.5);
+        gain.gain.setValueAtTime(0.12, now);
+        gain.gain.linearRampToValueAtTime(0.001, now + 1.2);
         
         osc.connect(gain);
         gain.connect(audioCtx.destination);
-        osc.start();
-        osc.stop(audioCtx.currentTime + 1.5);
+        osc.start(now);
+        osc.stop(now + 1.2);
     } catch(e) {}
 }
 
-function playAviatorCashoutSound() {
+function playOdibetCashoutSound() {
     if(!soundEnabled) return;
     try {
         initAudio();
@@ -1939,38 +1938,38 @@ function playAviatorCashoutSound() {
         let osc = audioCtx.createOscillator();
         let gain = audioCtx.createGain();
         osc.type = "sine";
-        osc.frequency.setValueAtTime(659.25, now); // E5
-        osc.frequency.setValueAtTime(987.77, now + 0.12); // B5
+        osc.frequency.setValueAtTime(523.25, now);
+        osc.frequency.setValueAtTime(783.99, now + 0.1);
+        osc.frequency.setValueAtTime(1046.50, now + 0.2);
         
-        gain.gain.setValueAtTime(0.22, now);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
         
         osc.connect(gain);
         gain.connect(audioCtx.destination);
         osc.start(now);
-        osc.stop(now + 0.4);
+        osc.stop(now + 0.35);
     } catch(e) {}
 }
 
-function playAviatorCrashSound() {
+function playOdibetCrashSound() {
     if(!soundEnabled) return;
     try {
         initAudio();
         let now = audioCtx.currentTime;
-        // Low distorted buzzer/crash rumble
         let osc = audioCtx.createOscillator();
         let gain = audioCtx.createGain();
         osc.type = "sawtooth";
-        osc.frequency.setValueAtTime(130, now);
-        osc.frequency.linearRampToValueAtTime(35, now + 0.6);
+        osc.frequency.setValueAtTime(220, now);
+        osc.frequency.linearRampToValueAtTime(40, now + 0.55);
         
         gain.gain.setValueAtTime(0.3, now);
-        gain.gain.linearRampToValueAtTime(0.0001, now + 0.6);
+        gain.gain.linearRampToValueAtTime(0.0001, now + 0.55);
         
         osc.connect(gain);
         gain.connect(audioCtx.destination);
         osc.start(now);
-        osc.stop(now + 0.6);
+        osc.stop(now + 0.55);
     } catch(e) {}
 }
 
@@ -2032,7 +2031,7 @@ async function fetchState() {
 
         if(gameState === "RUNNING") {
             if(oldState !== "RUNNING") {
-                playAviatorTakeoffSound();
+                playOdibetTakeoffSound();
             }
 
             document.getElementById("lblMultiplier").innerText = data.multiplier.toFixed(2) + "x";
@@ -2043,9 +2042,9 @@ async function fetchState() {
             
             let progress = Math.min((data.multiplier - 1.0) / 4.0, 1.0);
             let svgW = 400, svgH = 300;
-            let targetX = 50 + (progress * 300);
-            let targetY = 280 - (progress * 220);
-            let controlX = targetX / 2;
+            let targetX = 40 + (progress * 310);
+            let targetY = 270 - (progress * 210);
+            let controlX = targetX * 0.55;
             let controlY = 280;
             
             curvePath.setAttribute("d", `M 0 300 Q ${controlX} ${controlY} ${targetX} ${targetY}`);
@@ -2056,10 +2055,11 @@ async function fetchState() {
             
             planeEl.style.left = planeLeft + "px";
             planeEl.style.top = planeTop + "px";
+            planeEl.style.transform = `translate(-50%, 50%) rotate(${-15 - (progress * 25)}deg)`;
 
         } else if(gameState === "CRASHED") {
             if(oldState === "RUNNING") {
-                playAviatorCrashSound();
+                playOdibetCrashSound();
             }
             document.getElementById("lblMultiplier").innerText = "FLEW AWAY!";
             document.getElementById("lblStatusMsg").innerText = `Crashed at ${data.crash_point.toFixed(2)}x`;
@@ -2117,7 +2117,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum})
         });
         let d = await res.json();
-        if(d.success) playAviatorCashoutSound();
+        if(d.success) playOdibetCashoutSound();
         alert(d.message);
     } else {
         let amt = document.getElementById("betAmount" + betNum).value;
@@ -2128,7 +2128,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum, amount: amt, auto_cashout: auto})
         });
         let d = await res.json();
-        if(d.success) playAviatorTakeoffSound();
+        if(d.success) playOdibetTakeoffSound();
         alert(d.message);
     }
     fetchState();
@@ -2162,7 +2162,7 @@ async function withdrawFunds() {
     fetchState();
 }
 
-setInterval(fetchState, 80);
+setInterval(fetchState, 75);
 </script>
 </body>
 </html>
