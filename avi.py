@@ -1012,7 +1012,7 @@ from flask import (
 
 DB_NAME = "aviator_live.db"
 
-BETTING_WINDOW = 8.0
+BETTING_WINDOW = 5.0
 MAX_BETS = 2
 MAX_WITHDRAWAL = 250000.0
 CRASH_DISPLAY_TIME = 0.5
@@ -1090,7 +1090,6 @@ def init_db():
         )
     """)
 
-    # Create default Admin if missing
     admin = conn.execute("SELECT id FROM users WHERE username = ?", ("admin",)).fetchone()
     if not admin:
         conn.execute("""
@@ -1112,26 +1111,25 @@ def init_db():
 
 
 # ============================================================
-# GAME ENGINE & BOT FEED GENERATOR
+# GAME ENGINE & HIGH SPEED ACCELERATION
 # ============================================================
 
 def generate_crash_point():
     value = random.random()
     if value < 0.03:
-        return round(random.uniform(1.00, 1.15), 2)
+        return round(random.uniform(1.00, 1.10), 2)
     elif value < 0.20:
-        return round(random.uniform(1.16, 2.00), 2)
+        return round(random.uniform(1.11, 2.05), 2)
     elif value < 0.60:
-        return round(random.uniform(2.01, 5.00), 2)
-    elif value < 0.90:
+        return round(random.uniform(2.06, 5.00), 2)
+    elif value < 0.88:
         return round(random.uniform(5.01, 20.00), 2)
-    return round(random.uniform(20.00, 100.00), 2)
+    return round(random.uniform(20.00, 200.00), 2)
 
 
 def calculate_multiplier(elapsed):
-    multiplier = 1.0 + (elapsed * 0.25)
-    if multiplier > 3:
-        multiplier += (elapsed ** 1.15) * 0.03
+    # Ultra-fast Odibet climbing progression
+    multiplier = 1.0 + (elapsed * 0.65) + ((elapsed ** 1.42) * 0.15)
     return round(multiplier, 2)
 
 
@@ -1165,7 +1163,7 @@ def generate_bot_bets():
     for i, user in enumerate(selected_users):
         masked = user[:3] + "***" + str(random.randint(0,9))
         amount = round(random.choice([50, 100, 200, 500, 1000, 2500, 5000, 10000]), 2)
-        target_cashout = round(random.uniform(1.10, 8.50), 2) if random.random() > 0.15 else None
+        target_cashout = round(random.uniform(1.10, 10.00), 2) if random.random() > 0.15 else None
         
         bets.append({
             "id": f"bot_{i}",
@@ -1311,7 +1309,7 @@ def game_loop():
                 tick_game_locked()
         except Exception as e:
             print("Game engine error:", e)
-        time.sleep(0.05)
+        time.sleep(0.025)
 
 
 threading.Thread(target=game_loop, daemon=True).start()
@@ -1657,7 +1655,7 @@ def api_withdraw():
 
 
 # ============================================================
-# TEMPLATES (ODIBET AVIATOR THEME & ANIMATION)
+# TEMPLATES (ORIGINAL AVIATOR AUDIO + PRESERVED COLOR THEME)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -1801,7 +1799,6 @@ body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Robo
 .pill-green { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(34,197,94,0.2); color:#22c55e; border:1px solid #22c55e; white-space:nowrap; }
 .pill-red { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(239,68,68,0.2); color:#ef4444; border:1px solid #ef4444; white-space:nowrap; }
 
-/* Odibet Aviator Flight Red Background Canvas & SVG Graph */
 .aviator-screen { position:relative; height:360px; background:radial-gradient(circle at center, #591212 0%, #2b0606 60%, #160202 100%); border-radius:12px; border:2px solid #7a1c1c; display:flex; flex-direction:column; justify-content:center; align-items:center; overflow:hidden; }
 .multiplier-display { font-size:65px; font-weight:900; color:#fff; text-shadow:0 0 25px rgba(239,68,68,0.8); z-index:10; text-align:center; padding:0 10px; }
 .status-msg { font-size:16px; color:#eab308; font-weight:bold; margin-top:5px; z-index:10; }
@@ -1838,7 +1835,7 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 <div class="header">
     <div class="brand">✈️ ODIBET AVIATOR</div>
     <div class="wallet-box">
-        <button id="soundToggle" class="sound-btn" onclick="toggleSound()">🔊 Sound: ON</button>
+        <button id="soundToggle" class="sound-btn active" onclick="toggleSound()">🔊 Sound: ON</button>
         <span>Player: <b>{{ username }}</b></span>
         <span>Balance: <span class="balance-val" id="lblBalance">KSh 0.00</span></span>
         <a href="/logout" style="color:#ef4444; text-decoration:none; font-weight:bold; margin-left:5px;">Logout</a>
@@ -1860,7 +1857,6 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
         </div>
 
         <div class="aviator-screen" id="aviatorScreen">
-            <!-- Odibet Aviator SVG Curved Graph Line & Fighter Plane -->
             <svg class="flight-path" id="flightSvg" viewBox="0 0 400 300" preserveAspectRatio="none">
                 <path id="curvePath" d="M 0 300 Q 200 300 400 300" fill="none" stroke="#ef4444" stroke-width="4" />
             </svg>
@@ -1913,20 +1909,68 @@ function initAudio() {
     }
 }
 
-function playBeep(freq, type, duration) {
+// True Original Aviator Game Sound Synthesizers
+function playAviatorTakeoffSound() {
     if(!soundEnabled) return;
     try {
         initAudio();
+        // Authentic rising turbine sound generator
         let osc = audioCtx.createOscillator();
         let gain = audioCtx.createGain();
-        osc.type = type;
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(850, audioCtx.currentTime + 1.5);
+        
+        gain.gain.setValueAtTime(0.18, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.0001, audioCtx.currentTime + 1.5);
+        
         osc.connect(gain);
         gain.connect(audioCtx.destination);
         osc.start();
-        osc.stop(audioCtx.currentTime + duration);
+        osc.stop(audioCtx.currentTime + 1.5);
+    } catch(e) {}
+}
+
+function playAviatorCashoutSound() {
+    if(!soundEnabled) return;
+    try {
+        initAudio();
+        let now = audioCtx.currentTime;
+        let osc = audioCtx.createOscillator();
+        let gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(659.25, now); // E5
+        osc.frequency.setValueAtTime(987.77, now + 0.12); // B5
+        
+        gain.gain.setValueAtTime(0.22, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+        
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.4);
+    } catch(e) {}
+}
+
+function playAviatorCrashSound() {
+    if(!soundEnabled) return;
+    try {
+        initAudio();
+        let now = audioCtx.currentTime;
+        // Low distorted buzzer/crash rumble
+        let osc = audioCtx.createOscillator();
+        let gain = audioCtx.createGain();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(130, now);
+        osc.frequency.linearRampToValueAtTime(35, now + 0.6);
+        
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0.0001, now + 0.6);
+        
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.6);
     } catch(e) {}
 }
 
@@ -1987,8 +2031,9 @@ async function fetchState() {
         let curvePath = document.getElementById("curvePath");
 
         if(gameState === "RUNNING") {
-            if(oldState !== "RUNNING") playBeep(523.25, "sine", 0.4);
-            else playBeep(320 + (data.multiplier * 25), "triangle", 0.08);
+            if(oldState !== "RUNNING") {
+                playAviatorTakeoffSound();
+            }
 
             document.getElementById("lblMultiplier").innerText = data.multiplier.toFixed(2) + "x";
             document.getElementById("lblStatusMsg").innerText = "Fly away high!";
@@ -1996,7 +2041,7 @@ async function fetchState() {
             
             planeEl.style.display = "block";
             
-            let progress = Math.min((data.multiplier - 1.0) / 5.0, 1.0);
+            let progress = Math.min((data.multiplier - 1.0) / 4.0, 1.0);
             let svgW = 400, svgH = 300;
             let targetX = 50 + (progress * 300);
             let targetY = 280 - (progress * 220);
@@ -2013,7 +2058,9 @@ async function fetchState() {
             planeEl.style.top = planeTop + "px";
 
         } else if(gameState === "CRASHED") {
-            if(oldState === "RUNNING") playBeep(110, "sawtooth", 0.6);
+            if(oldState === "RUNNING") {
+                playAviatorCrashSound();
+            }
             document.getElementById("lblMultiplier").innerText = "FLEW AWAY!";
             document.getElementById("lblStatusMsg").innerText = `Crashed at ${data.crash_point.toFixed(2)}x`;
             document.getElementById("lblMultiplier").style.color = "#ef4444";
@@ -2070,7 +2117,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum})
         });
         let d = await res.json();
-        if(d.success) playBeep(880, "sine", 0.3);
+        if(d.success) playAviatorCashoutSound();
         alert(d.message);
     } else {
         let amt = document.getElementById("betAmount" + betNum).value;
@@ -2081,7 +2128,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum, amount: amt, auto_cashout: auto})
         });
         let d = await res.json();
-        if(d.success) playBeep(440, "sine", 0.2);
+        if(d.success) playAviatorTakeoffSound();
         alert(d.message);
     }
     fetchState();
@@ -2115,7 +2162,7 @@ async function withdrawFunds() {
     fetchState();
 }
 
-setInterval(fetchState, 300);
+setInterval(fetchState, 80);
 </script>
 </body>
 </html>
