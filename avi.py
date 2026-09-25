@@ -988,7 +988,6 @@
 
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
-
 import os
 import time
 import random
@@ -1083,7 +1082,6 @@ def init_db():
         )
     """)
 
-    # Temporary store for password reset verification codes
     conn.execute("""
         CREATE TABLE IF NOT EXISTS password_resets (
             phone_number TEXT PRIMARY KEY,
@@ -1160,7 +1158,6 @@ FAKE_USERS = [
 ]
 
 def generate_bot_bets():
-    """Generates over 50 realistic random player bets for the new round."""
     bets = []
     count = random.randint(55, 75)
     selected_users = random.sample(FAKE_USERS * 2, count)
@@ -1486,9 +1483,8 @@ def forgot_password():
         if step == "request":
             user = conn.execute("SELECT * FROM users WHERE phone_number = ?", (phone,)).fetchone()
             if user:
-                # Generate 4-digit code
                 code = f"{random.randint(1000, 9999)}"
-                expires = time.time() + 300  # valid for 5 mins
+                expires = time.time() + 300
                 conn.execute("INSERT OR REPLACE INTO password_resets (phone_number, code, expires_at) VALUES (?, ?, ?)", (phone, code, expires))
                 conn.commit()
                 success = f"Verification code sent to {phone}. (Simulation Code: {code})"
@@ -1568,7 +1564,6 @@ def api_state():
         isAdmin = (user["role"] == "ADMIN")
 
         conn = get_db()
-        # Fetch last 20 rounds in chronological order (Oldest first, Newest last -> right direction)
         history_rows = conn.execute("SELECT crash_point FROM rounds WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 20").fetchall()
         history = [float(r["crash_point"]) for r in history_rows][::-1]
 
@@ -1662,7 +1657,7 @@ def api_withdraw():
 
 
 # ============================================================
-# TEMPLATES
+# TEMPLATES (ODIBET AVIATOR THEME & ANIMATION)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -1670,11 +1665,11 @@ LOGIN_HTML = r"""
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Aviator - Login</title>
 <style>
-body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#0f141d; font-family:Arial,sans-serif; color:white; }
-.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#181f2c; border:1px solid #273142; box-shadow:0 10px 25px rgba(0,0,0,0.5); box-sizing:border-box; margin:15px; }
+body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#1b0606; font-family:Arial,sans-serif; color:white; }
+.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#2c0c0c; border:1px solid #5a1515; box-shadow:0 10px 25px rgba(0,0,0,0.7); box-sizing:border-box; margin:15px; }
 h2 { text-align:center; color:#eab308; }
-input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #273142; background:#0f141d; color:white; box-sizing:border-box; }
-button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#0f141d; font-weight:bold; cursor:pointer; }
+input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #5a1515; background:#1b0606; color:white; box-sizing:border-box; }
+button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#1b0606; font-weight:bold; cursor:pointer; }
 button:hover { background:#ca8a04; }
 .error { color:#ef4444; text-align:center; margin-bottom:10px; font-size:14px; }
 .success { color:#22c55e; text-align:center; margin-bottom:10px; font-size:14px; }
@@ -1708,11 +1703,11 @@ FORGOT_HTML = r"""
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Aviator - Reset Password</title>
 <style>
-body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#0f141d; font-family:Arial,sans-serif; color:white; }
-.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#181f2c; border:1px solid #273142; box-shadow:0 10px 25px rgba(0,0,0,0.5); box-sizing:border-box; margin:15px; }
+body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#1b0606; font-family:Arial,sans-serif; color:white; }
+.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#2c0c0c; border:1px solid #5a1515; box-shadow:0 10px 25px rgba(0,0,0,0.7); box-sizing:border-box; margin:15px; }
 h2 { text-align:center; color:#eab308; }
-input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #273142; background:#0f141d; color:white; box-sizing:border-box; }
-button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#0f141d; font-weight:bold; cursor:pointer; }
+input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #5a1515; background:#1b0606; color:white; box-sizing:border-box; }
+button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#1b0606; font-weight:bold; cursor:pointer; }
 .error { color:#ef4444; text-align:center; margin-bottom:10px; font-size:14px; }
 .success { color:#22c55e; text-align:center; margin-bottom:10px; font-size:14px; }
 p { text-align:center; font-size:14px; color:#9ca3af; }
@@ -1752,11 +1747,11 @@ REGISTER_HTML = r"""
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Aviator - Register</title>
 <style>
-body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#0f141d; font-family:Arial,sans-serif; color:white; }
-.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#181f2c; border:1px solid #273142; box-shadow:0 10px 25px rgba(0,0,0,0.5); box-sizing:border-box; margin:15px; }
+body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#1b0606; font-family:Arial,sans-serif; color:white; }
+.box { width:100%; max-width:380px; padding:30px; border-radius:14px; background:#2c0c0c; border:1px solid #5a1515; box-shadow:0 10px 25px rgba(0,0,0,0.7); box-sizing:border-box; margin:15px; }
 h2 { text-align:center; color:#eab308; }
-input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #273142; background:#0f141d; color:white; box-sizing:border-box; }
-button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#0f141d; font-weight:bold; cursor:pointer; }
+input { width:100%; padding:12px; font-size:16px; margin-top:8px; margin-bottom:15px; border-radius:8px; border:1px solid #5a1515; background:#1b0606; color:white; box-sizing:border-box; }
+button { width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#eab308; color:#1b0606; font-weight:bold; cursor:pointer; }
 .error { color:#ef4444; text-align:center; margin-bottom:10px; font-size:14px; }
 p { text-align:center; font-size:14px; color:#9ca3af; }
 a { color:#eab308; text-decoration:none; }
@@ -1786,54 +1781,49 @@ HTML = r"""
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Aviator Live</title>
+<title>Odibet Aviator Live</title>
 <style>
 * { box-sizing:border-box; }
-body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#0b0e14; color:#fff; }
-.header { display:flex; justify-content:space-between; align-items:center; background:#121824; padding:12px 15px; border-bottom:1px solid #222b3d; flex-wrap:wrap; gap:10px; }
+body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#160404; color:#fff; }
+.header { display:flex; justify-content:space-between; align-items:center; background:#240808; padding:12px 15px; border-bottom:2px solid #5a1515; flex-wrap:wrap; gap:10px; }
 .brand { color:#eab308; font-size:18px; font-weight:900; letter-spacing:1px; }
 .wallet-box { display:flex; gap:12px; align-items:center; font-size:13px; flex-wrap:wrap; }
 .balance-val { color:#22c55e; font-weight:bold; font-size:15px; }
 
-/* Sound Settings Button Toggle */
-.sound-btn { background:#1e293b; border:1px solid #334155; color:#cbd5e1; padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:bold; }
-.sound-btn.active { background:#eab308; color:#0f141d; border-color:#eab308; }
+.sound-btn { background:#3a1010; border:1px solid #7a1c1c; color:#cbd5e1; padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:bold; }
+.sound-btn.active { background:#eab308; color:#1b0606; border-color:#eab308; }
 
-/* Responsive Main Layout Container */
 .main-container { display:flex; max-width:1400px; margin:15px auto; gap:15px; padding:0 10px; }
-.sidebar-bets { width:320px; min-width:280px; background:#121824; border-radius:12px; border:1px solid #222b3d; padding:12px; height:520px; overflow-y:auto; }
+.sidebar-bets { width:320px; min-width:280px; background:#240808; border-radius:12px; border:1px solid #5a1515; padding:12px; height:520px; overflow-y:auto; }
 .game-area { flex:1; display:flex; flex-direction:column; gap:15px; min-width:0; }
 
-/* History Bar (Last come in right direction: Oldest -> Newest left to right) */
-.history-bar { display:flex; gap:6px; background:#121824; padding:8px 12px; border-radius:8px; border:1px solid #222b3d; overflow-x:auto; direction:ltr; justify-content:flex-start; align-items:center; }
-.pill-green { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid #22c55e; white-space:nowrap; }
-.pill-red { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(239,68,68,0.15); color:#ef4444; border:1px solid #ef4444; white-space:nowrap; }
+.history-bar { display:flex; gap:6px; background:#240808; padding:8px 12px; border-radius:8px; border:1px solid #5a1515; overflow-x:auto; direction:ltr; justify-content:flex-start; align-items:center; }
+.pill-green { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(34,197,94,0.2); color:#22c55e; border:1px solid #22c55e; white-space:nowrap; }
+.pill-red { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:bold; background:rgba(239,68,68,0.2); color:#ef4444; border:1px solid #ef4444; white-space:nowrap; }
 
-/* Aviator Game Canvas & Animation Area */
-.aviator-screen { position:relative; height:360px; background:radial-gradient(circle at center, #1b0a1a 0%, #0d060f 60%, #070308 100%); border-radius:12px; border:2px solid #222b3d; display:flex; flex-direction:column; justify-content:center; align-items:center; overflow:hidden; }
-.multiplier-display { font-size:60px; font-weight:900; color:#fff; text-shadow:0 0 20px rgba(239,68,68,0.6); z-index:10; text-align:center; padding:0 10px; }
+/* Odibet Aviator Flight Red Background Canvas & SVG Graph */
+.aviator-screen { position:relative; height:360px; background:radial-gradient(circle at center, #591212 0%, #2b0606 60%, #160202 100%); border-radius:12px; border:2px solid #7a1c1c; display:flex; flex-direction:column; justify-content:center; align-items:center; overflow:hidden; }
+.multiplier-display { font-size:65px; font-weight:900; color:#fff; text-shadow:0 0 25px rgba(239,68,68,0.8); z-index:10; text-align:center; padding:0 10px; }
 .status-msg { font-size:16px; color:#eab308; font-weight:bold; margin-top:5px; z-index:10; }
 
-/* Flying Airplane Aviator Animation */
-.plane-container { position: absolute; bottom: 30px; left: 30px; font-size: 45px; transition: transform 0.1s linear; z-index: 5; pointer-events: none; filter: drop-shadow(0 0 10px rgba(234,179,8,0.7)); display: none; }
-.plane-trail { position: absolute; bottom: 0; left: 0; height: 3px; background: linear-gradient(90deg, transparent, #ef4444, #eab308); z-index: 4; display: none; transition: width 0.1s linear; }
+svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
+.plane-icon { position: absolute; font-size: 38px; z-index: 5; pointer-events: none; transform: translate(-50%, 50%); filter: drop-shadow(0 0 12px rgba(255,255,255,0.8)); display: none; }
 
 .admin-banner { background:#7f1d1d; border:1px solid #ef4444; padding:10px 15px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; font-weight:bold; color:#fca5a5; flex-wrap:wrap; gap:5px; }
 .admin-val { color:#fff; font-size:18px; }
 
 .controls-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-.bet-panel { background:#121824; border:1px solid #222b3d; border-radius:12px; padding:12px; }
-input { width:100%; padding:10px; font-size:16px; margin:4px 0 10px 0; border-radius:6px; border:1px solid #273142; background:#0b0e14; color:white; }
+.bet-panel { background:#240808; border:1px solid #5a1515; border-radius:12px; padding:12px; }
+input { width:100%; padding:10px; font-size:16px; margin:4px 0 10px 0; border-radius:6px; border:1px solid #5a1515; background:#160404; color:white; }
 button { width:100%; padding:12px; border:none; border-radius:8px; background:#16a34a; color:white; font-weight:900; cursor:pointer; font-size:14px; }
 button.cashout { background:#dc2626; }
 button:disabled { opacity:0.4; cursor:not-allowed; }
 
-.wallet-panel { background:#121824; border:1px solid #222b3d; border-radius:12px; padding:12px; margin-top:5px; }
+.wallet-panel { background:#240808; border:1px solid #5a1515; border-radius:12px; padding:12px; margin-top:5px; }
 .wallet-row { display:flex; gap:10px; margin-top:8px; flex-wrap:wrap; }
 .wallet-row button { flex:1; min-width:140px; }
-.bet-item { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #1a2333; font-size:13px; align-items:center; gap:5px; }
+.bet-item { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #3a1010; font-size:13px; align-items:center; gap:5px; }
 
-/* Mobile & Android Adaptability */
 @media(max-width: 900px) {
     .main-container { flex-direction:column-reverse; }
     .sidebar-bets { width:100%; height:280px; }
@@ -1846,7 +1836,7 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 <body>
 
 <div class="header">
-    <div class="brand">✈️ AVIATOR</div>
+    <div class="brand">✈️ ODIBET AVIATOR</div>
     <div class="wallet-box">
         <button id="soundToggle" class="sound-btn" onclick="toggleSound()">🔊 Sound: ON</button>
         <span>Player: <b>{{ username }}</b></span>
@@ -1856,32 +1846,30 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 </div>
 
 <div class="main-container">
-    <!-- Left Sidebar: Over 50 Live Active Bets Feed -->
     <div class="sidebar-bets">
-        <h4 style="margin-top:0; color:#9ca3af; border-bottom:1px solid #222b3d; padding-bottom:8px;">ALL BETS (<span id="betCount">0</span>)</h4>
+        <h4 style="margin-top:0; color:#eab308; border-bottom:1px solid #5a1515; padding-bottom:8px;">ALL BETS (<span id="betCount">0</span>)</h4>
         <div id="liveBetsFeed"></div>
     </div>
 
-    <!-- Main Game Area -->
     <div class="game-area">
-        <!-- History Bar (Max 20 Rounds: Green if >= 2.00x, Red if < 2.00x, chronological right direction) -->
         <div class="history-bar" id="historyBar"></div>
 
-        <!-- ADMIN ONLY PANEL -->
         <div id="adminPanel" class="admin-banner" style="display:none;">
             <span>ADMIN PANEL: Next Round Preview</span>
             <span class="admin-val" id="lblNextCrash">--</span>
         </div>
 
-        <!-- Aviator Screen with Airplane Animation -->
         <div class="aviator-screen" id="aviatorScreen">
-            <div class="plane-trail" id="planeTrail"></div>
-            <div class="plane-container" id="planeContainer">✈️</div>
+            <!-- Odibet Aviator SVG Curved Graph Line & Fighter Plane -->
+            <svg class="flight-path" id="flightSvg" viewBox="0 0 400 300" preserveAspectRatio="none">
+                <path id="curvePath" d="M 0 300 Q 200 300 400 300" fill="none" stroke="#ef4444" stroke-width="4" />
+            </svg>
+            <div class="plane-icon" id="planeIcon">✈️</div>
+            
             <div class="multiplier-display" id="lblMultiplier">1.00x</div>
             <div class="status-msg" id="lblStatusMsg">Waiting for next round...</div>
         </div>
 
-        <!-- Betting Controls -->
         <div class="controls-grid">
             <div class="bet-panel">
                 <div style="font-weight:bold;">Bet 1</div>
@@ -1901,7 +1889,6 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
             </div>
         </div>
 
-        <!-- Wallet Deposit & Withdrawal -->
         <div class="wallet-panel">
             <h4 style="margin-top:0; color:#eab308;">M-Pesa Wallet</h4>
             <label>Transaction Amount (KSh)</label>
@@ -1972,7 +1959,6 @@ async function fetchState() {
             document.getElementById("adminPanel").style.display = "none";
         }
 
-        // Render History Pills (Chronological order: Oldest to Newest left-to-right)
         let histHtml = "";
         (data.history || []).forEach(val => {
             let pillClass = val >= 2.0 ? "pill-green" : "pill-red";
@@ -1997,43 +1983,49 @@ async function fetchState() {
         });
         document.getElementById("liveBetsFeed").innerHTML = feedHtml;
 
-        let planeEl = document.getElementById("planeContainer");
-        let trailEl = document.getElementById("planeTrail");
+        let planeEl = document.getElementById("planeIcon");
+        let curvePath = document.getElementById("curvePath");
 
         if(gameState === "RUNNING") {
-            if(oldState !== "RUNNING") playBeep(523.25, "sine", 0.4); // Takeoff sound
-            else playBeep(300 + (data.multiplier * 30), "triangle", 0.08); // Ticking sound
+            if(oldState !== "RUNNING") playBeep(523.25, "sine", 0.4);
+            else playBeep(320 + (data.multiplier * 25), "triangle", 0.08);
 
             document.getElementById("lblMultiplier").innerText = data.multiplier.toFixed(2) + "x";
             document.getElementById("lblStatusMsg").innerText = "Fly away high!";
             document.getElementById("lblMultiplier").style.color = "#fff";
             
             planeEl.style.display = "block";
-            trailEl.style.display = "block";
             
-            let progress = Math.min((data.multiplier - 1.0) / 4.0, 1.0);
-            let posX = 30 + (progress * 220);
-            let posY = 30 + (progress * 140);
-            planeEl.style.transform = `translate(${posX}px, -${posY}px) rotate(-15deg)`;
-            trailEl.style.width = (posX + 10) + "px";
+            let progress = Math.min((data.multiplier - 1.0) / 5.0, 1.0);
+            let svgW = 400, svgH = 300;
+            let targetX = 50 + (progress * 300);
+            let targetY = 280 - (progress * 220);
+            let controlX = targetX / 2;
+            let controlY = 280;
+            
+            curvePath.setAttribute("d", `M 0 300 Q ${controlX} ${controlY} ${targetX} ${targetY}`);
+            
+            let screenBox = document.getElementById("aviatorScreen").getBoundingClientRect();
+            let planeLeft = (targetX / svgW) * screenBox.width;
+            let planeTop = (targetY / svgH) * screenBox.height;
+            
+            planeEl.style.left = planeLeft + "px";
+            planeEl.style.top = planeTop + "px";
 
         } else if(gameState === "CRASHED") {
-            if(oldState === "RUNNING") playBeep(120, "sawtooth", 0.5); // Crash sound
+            if(oldState === "RUNNING") playBeep(110, "sawtooth", 0.6);
             document.getElementById("lblMultiplier").innerText = "FLEW AWAY!";
             document.getElementById("lblStatusMsg").innerText = `Crashed at ${data.crash_point.toFixed(2)}x`;
             document.getElementById("lblMultiplier").style.color = "#ef4444";
             
-            planeEl.style.transform = `translate(260px, -180px) rotate(75deg) scale(0.8)`;
-            setTimeout(() => { planeEl.style.display = "none"; trailEl.style.display = "none"; }, 1500);
+            setTimeout(() => { planeEl.style.display = "none"; }, 1200);
 
         } else {
             document.getElementById("lblMultiplier").innerText = "1.00x";
             document.getElementById("lblStatusMsg").innerText = "Place your bets!";
             document.getElementById("lblMultiplier").style.color = "#22c55e";
+            curvePath.setAttribute("d", "M 0 300 Q 200 300 400 300");
             planeEl.style.display = "none";
-            planeEl.style.transform = "translate(0px, 0px) rotate(0deg)";
-            trailEl.style.width = "0px";
-            trailEl.style.display = "none";
         }
 
         userBets = data.bets || {};
@@ -2078,7 +2070,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum})
         });
         let d = await res.json();
-        if(d.success) playBeep(880, "sine", 0.3); // Win sound
+        if(d.success) playBeep(880, "sine", 0.3);
         alert(d.message);
     } else {
         let amt = document.getElementById("betAmount" + betNum).value;
@@ -2089,7 +2081,7 @@ async function handleBet(betNum) {
             body: JSON.stringify({bet_number: betNum, amount: amt, auto_cashout: auto})
         });
         let d = await res.json();
-        if(d.success) playBeep(440, "sine", 0.2); // Bet placed sound
+        if(d.success) playBeep(440, "sine", 0.2);
         alert(d.message);
     }
     fetchState();
