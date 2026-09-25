@@ -2852,7 +2852,7 @@ def api_withdraw():
 
 
 # ============================================================
-# TEMPLATES (RESPONSIVE LAYOUT + FUNCTIONAL MENU & DEPOSIT LINK)
+# TEMPLATES (LIVE CASH-OUT WINNINGS PREVIEW ON BUTTON)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -3084,7 +3084,7 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
 .quick-btn { background:#240808; border:1px solid #4a1515; color:#d1d5db; padding:6px; border-radius:6px; font-size:12px; font-weight:bold; cursor:pointer; text-align:center; }
 .quick-btn:hover { background:#3a1010; color:#fff; }
 
-.action-btn { width:100%; padding:14px; border:none; border-radius:10px; background:#22c55e; color:white; font-weight:900; font-size:16px; cursor:pointer; text-transform:uppercase; box-shadow:0 4px 12px rgba(34,197,94,0.3); }
+.action-btn { width:100%; padding:14px; border:none; border-radius:10px; background:#22c55e; color:white; font-weight:900; font-size:15px; cursor:pointer; text-transform:uppercase; box-shadow:0 4px 12px rgba(34,197,94,0.3); display:flex; flex-direction:column; align-items:center; justify-content:center; line-height:1.2; }
 .action-btn.cashout { background:#dc2626; box-shadow:0 4px 12px rgba(220,38,38,0.3); }
 .action-btn:disabled { opacity:0.4; cursor:not-allowed; box-shadow:none; }
 
@@ -3103,7 +3103,7 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
 <body>
 
 <div class="app-wrapper">
-    <!-- Side Menu Drawer (Fully Functional) -->
+    <!-- Side Menu Drawer -->
     <div class="menu-drawer desktop-only-sidebar" id="menuDrawer">
         <div class="menu-header">
             <span style="font-weight:bold; color:#eab308; font-size:16px;">Odi Menu</span>
@@ -3234,7 +3234,7 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
         <h3 id="modalTitle">Deposit Funds</h3>
         <p id="modalDesc" style="font-size:13px; color:#aaa;">Paste your M-Pesa payment prompt link or phone number:</p>
         <input type="text" id="modalInputLink" placeholder="https://pay.mpesa.co.ke/... or 2547XXXXXXXX">
-        <label style="font-size:12px; color:#aaa;" id="amountLabel">Amount (Min. 200 KES):</label>
+        <label style="font-size:12px; color:#aaa;" id="amountLabel">Amount (Min. KSh 200):</label>
         <input type="number" id="modalInputAmount" value="500" min="200">
         <div class="modal-btns">
             <button onclick="closeModal()" style="background:#444; color:#fff;">Cancel</button>
@@ -3250,6 +3250,7 @@ let soundEnabled = true;
 let audioCtx = null;
 let modalType = 'deposit';
 let autoModes = {1: false, 2: false};
+let currentGlobalMultiplier = 1.00;
 
 function initAudio() {
     if(!audioCtx) {
@@ -3364,7 +3365,7 @@ function switchTab(slot, mode) {
 
 function setAmount(slot, val) {
     document.getElementById("betAmount" + slot).value = val.toFixed(2);
-    updateButtonLabels();
+    updateButtons();
 }
 
 function adjustAmount(slot, delta) {
@@ -3372,20 +3373,7 @@ function adjustAmount(slot, delta) {
     let cur = parseFloat(inp.value) || 0;
     let nxt = Math.max(50, cur + delta);
     inp.value = nxt.toFixed(2);
-    updateButtonLabels();
-}
-
-function updateButtonLabels() {
-    for(let i=1; i<=2; i++) {
-        let btn = document.getElementById("btnAction" + i);
-        let bet = userBets[i];
-        if(!bet || bet.status !== "ACTIVE") {
-            let amt = document.getElementById("betAmount" + i).value;
-            if(gameState === "BETTING") {
-                btn.innerText = `Bet ${parseFloat(amt).toFixed(2)} KES`;
-            }
-        }
-    }
+    updateButtons();
 }
 
 function openDepositModal() {
@@ -3459,6 +3447,8 @@ async function fetchState() {
         
         let oldState = gameState;
         gameState = data.status;
+        currentGlobalMultiplier = data.multiplier;
+        
         document.getElementById("lblBalance").innerText = data.balance.toLocaleString(undefined, {minimumFractionDigits:2}) + " KES";
         
         if(data.is_admin) {
@@ -3554,9 +3544,12 @@ function updateButtons() {
     for(let i=1; i<=2; i++) {
         let btn = document.getElementById("btnAction" + i);
         let bet = userBets[i];
+        let amt = parseFloat(document.getElementById("betAmount" + i).value) || 0;
+        
         if(bet && bet.status === "ACTIVE") {
             if(gameState === "RUNNING") {
-                btn.innerText = "CASHOUT";
+                let liveWinnings = (amt * currentGlobalMultiplier).toFixed(2);
+                btn.innerHTML = `CASHOUT<span style="font-size:12px; font-weight:normal; color:#fed7aa;">KES ${Number(liveWinnings).toLocaleString()}</span>`;
                 btn.className = "action-btn cashout";
                 btn.disabled = false;
             } else {
@@ -3565,9 +3558,8 @@ function updateButtons() {
                 btn.disabled = true;
             }
         } else {
-            let amt = document.getElementById("betAmount" + i).value;
             if(gameState === "BETTING") {
-                btn.innerText = `Bet ${parseFloat(amt).toFixed(2)} KES`;
+                btn.innerText = `Bet ${amt.toFixed(2)} KES`;
                 btn.className = "action-btn";
                 btn.disabled = false;
             } else {
@@ -3610,7 +3602,3 @@ setInterval(fetchState, 75);
 </script>
 </body>
 </html>
-"""
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
