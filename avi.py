@@ -2171,7 +2171,6 @@
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000, debug=True)
 
-
 import os
 import time
 import random
@@ -2826,7 +2825,7 @@ def api_confirm_deposit():
         return jsonify({"success": False, "message": f"Minimum deposit amount is KSh {MIN_DEPOSIT:,.2f}."})
     
     add_balance(session["username"], amount)
-    return jsonify({"success": True, "message": f"Successfully deposited KSh {amount:,.2f} via M-Pesa!"})
+    return jsonify({"success": True, "message": f"Successfully deposited KSh {amount:,.2f} via M-Pesa prompt link!"})
 
 
 @app.route("/api/withdraw", methods=["POST"])
@@ -2853,7 +2852,7 @@ def api_withdraw():
 
 
 # ============================================================
-# TEMPLATES (RESPONSIVE LAYOUT FOR MOBILE & DESKTOP)
+# TEMPLATES (RESPONSIVE LAYOUT + FUNCTIONAL MENU & DEPOSIT LINK)
 # ============================================================
 
 LOGIN_HTML = r"""
@@ -2982,7 +2981,6 @@ HTML = r"""
 * { box-sizing:border-box; }
 body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#0f0f0f; color:#fff; display:flex; justify-content:center; }
 
-/* Responsive Main Shell Wrapper */
 .app-wrapper { 
     width:100%; 
     max-width:480px; 
@@ -2996,32 +2994,30 @@ body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Robo
     transition: all 0.3s ease;
 }
 
-/* Desktop Expansion Override */
+/* Desktop Responsive Layout */
 @media (min-width: 900px) {
     body { background: #080202; align-items: center; padding: 20px 0; }
-    .app-wrapper { max-width: 1100px; border: 1px solid #4a1515; border-radius: 16px; overflow: hidden; box-shadow: 0 15px 40px rgba(0,0,0,0.9); min-height: 850px; display: grid; grid-template-columns: 280px 1fr 340px; grid-template-rows: auto auto 1fr; }
+    .app-wrapper { max-width: 1150px; border: 1px solid #4a1515; border-radius: 16px; overflow: hidden; box-shadow: 0 15px 40px rgba(0,0,0,0.9); min-height: 850px; display: grid; grid-template-columns: 280px 1fr 340px; grid-template-rows: auto auto 1fr; }
     
     .top-header { grid-column: 1 / -1; }
     .aviator-subbar { grid-column: 1 / -1; }
     .history-bar { grid-column: 1 / -1; }
     
-    /* Desktop Sidebar Menu (Always visible on desktop) */
-    .menu-drawer { position: relative !important; left: 0 !important; width: 100% !important; height: 100% !important; box-shadow: none !important; border-right: 1px solid #3a1010 !important; grid-row: 4 / 6; }
+    .menu-drawer { position: relative !important; left: 0 !important; width: 100% !important; height: 100% !important; box-shadow: none !important; border-right: 1px solid #3a1010 !important; grid-row: 4 / 6; display: flex !important; }
     .menu-header button { display: none !important; }
     
-    /* Center Game Stage */
     .center-stage { grid-column: 2; grid-row: 4; display: flex; flex-direction: column; }
     .aviator-screen { height: 360px !important; }
     .betting-container { flex-direction: row !important; gap: 12px; }
     .bet-card { flex: 1; }
 
-    /* Right Sidebar Live Feed on Desktop */
     .live-feed-section { grid-column: 3; grid-row: 4; max-height: 100% !important; border-left: 1px solid #3a1010; border-top: none !important; }
     .desktop-hide { display: none !important; }
 }
 
 @media (max-width: 899px) {
-    .desktop-only-sidebar { display: none !important; }
+    .desktop-only-sidebar { display: none; }
+    .desktop-only-sidebar.open { display: flex; }
     .center-stage { display: flex; flex-direction: column; width: 100%; }
 }
 
@@ -3055,7 +3051,7 @@ body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Robo
 svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
 .plane-icon { position: absolute; font-size: 38px; z-index: 5; pointer-events: none; transform: translate(-30%, -70%) rotate(-12deg); filter: drop-shadow(0 0 10px rgba(239,68,68,0.9)); display: none; }
 
-/* Mobile Side Menu Drawer */
+/* Side Menu Drawer */
 .menu-drawer { position: absolute; top: 0; left: -280px; width: 280px; height: 100%; background: #1c0707; z-index: 100; transition: left 0.3s ease; border-right: 2px solid #5a1515; box-shadow: 5px 0 25px rgba(0,0,0,0.8); display: flex; flex-direction: column; }
 .menu-drawer.open { left: 0; }
 .menu-header { background: #2c0c0c; padding: 18px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #5a1515; }
@@ -3107,17 +3103,17 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
 <body>
 
 <div class="app-wrapper">
-    <!-- Mobile Side Menu Drawer -->
+    <!-- Side Menu Drawer (Fully Functional) -->
     <div class="menu-drawer desktop-only-sidebar" id="menuDrawer">
         <div class="menu-header">
             <span style="font-weight:bold; color:#eab308; font-size:16px;">Odi Menu</span>
             <button class="desktop-hide" onclick="toggleMenu()" style="background:none; border:none; color:#fff; font-size:18px; cursor:pointer;">✕</button>
         </div>
         <div class="menu-items">
-            <div class="menu-item" onclick="openDepositModal()">💳 Deposit (Min. 200 KES)</div>
-            <div class="menu-item" onclick="openWithdrawModal()">💸 Withdraw (Min. 1,000 KES)</div>
-            <div class="menu-item" onclick="alert('Username: {{ username }}\nAccount Status: Active');">👤 My Profile</div>
-            <div class="menu-item" onclick="alert('Aviator is a multiplayer crash game where the multiplier increases as the plane flies. Cash out before it flies away!');">📖 How to Play</div>
+            <div class="menu-item" onclick="openDepositModal()">💳 Deposit (Min. KSh 200)</div>
+            <div class="menu-item" onclick="openWithdrawModal()">💸 Withdraw (Min. KSh 1,000)</div>
+            <div class="menu-item" onclick="showProfile()">👤 My Profile</div>
+            <div class="menu-item" onclick="showHowToPlay()">📖 How to Play</div>
             <div class="menu-item" onclick="window.location.href='/logout'" style="color:#ef4444;">🚪 Logout</div>
         </div>
     </div>
@@ -3137,7 +3133,7 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
         </div>
     </div>
 
-    <!-- Center Stage (Game + Betting Controls) -->
+    <!-- Center Stage -->
     <div class="center-stage">
         <!-- Aviator Bar -->
         <div class="aviator-subbar">
@@ -3222,7 +3218,7 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
         </div>
     </div>
 
-    <!-- Live Active Users Feed (800+ Users) -->
+    <!-- Live Active Users Feed (800+ Users with User at Top) -->
     <div class="live-feed-section">
         <div class="feed-header">
             <span>LIVE ACTIVE USERS (~820)</span>
@@ -3232,17 +3228,17 @@ svg.flight-path { position: absolute; top: 0; left: 0; width: 100%; height: 100%
     </div>
 </div>
 
-<!-- Modal Dialog for Deposit / Withdraw -->
+<!-- Modal Dialog for Deposit (Prompt Link) & Withdraw -->
 <div class="modal-overlay" id="walletModal">
     <div class="modal-content">
         <h3 id="modalTitle">Deposit Funds</h3>
-        <p id="modalDesc" style="font-size:13px; color:#aaa;">Enter your payment prompt link or M-Pesa number:</p>
-        <input type="text" id="modalInputLink" placeholder="Paste link or phone 2547XXXXXXXX">
-        <label style="font-size:12px; color:#aaa;">Amount (KES):</label>
-        <input type="number" id="modalInputAmount" value="500" min="1">
+        <p id="modalDesc" style="font-size:13px; color:#aaa;">Paste your M-Pesa payment prompt link or phone number:</p>
+        <input type="text" id="modalInputLink" placeholder="https://pay.mpesa.co.ke/... or 2547XXXXXXXX">
+        <label style="font-size:12px; color:#aaa;" id="amountLabel">Amount (Min. 200 KES):</label>
+        <input type="number" id="modalInputAmount" value="500" min="200">
         <div class="modal-btns">
             <button onclick="closeModal()" style="background:#444; color:#fff;">Cancel</button>
-            <button onclick="submitModalAction()" style="background:#22c55e; color:#fff;">Confirm</button>
+            <button onclick="submitModalAction()" style="background:#22c55e; color:#fff;">Proceed</button>
         </div>
     </div>
 </div>
@@ -3338,6 +3334,16 @@ function toggleMenu() {
     }
 }
 
+function showProfile() {
+    alert("Logged in user account is active.\nMinimum Deposit: KSh 200\nMinimum Withdrawal: KSh 1,000");
+    if(window.innerWidth < 900) toggleMenu();
+}
+
+function showHowToPlay() {
+    alert("Aviator Rules:\n1. Place your bet before the round starts.\n2. Watch the plane fly and the multiplier increase.\n3. Cash out before the plane flies away to win your stake multiplied by the current multiplier!");
+    if(window.innerWidth < 900) toggleMenu();
+}
+
 function switchTab(slot, mode) {
     let tabBet = document.getElementById(`tab${slot}_bet`);
     let tabAuto = document.getElementById(`tab${slot}_auto`);
@@ -3384,9 +3390,11 @@ function updateButtonLabels() {
 
 function openDepositModal() {
     modalType = 'deposit';
-    document.getElementById("modalTitle").innerText = "Deposit Funds (Min 200 KES)";
-    document.getElementById("modalDesc").innerText = "Paste M-Pesa link or phone number:";
+    document.getElementById("modalTitle").innerText = "Deposit Funds (Min. KSh 200)";
+    document.getElementById("modalDesc").innerText = "Paste your M-Pesa payment prompt link or phone number:";
+    document.getElementById("amountLabel").innerText = "Deposit Amount (KES):";
     document.getElementById("modalInputAmount").value = "500";
+    document.getElementById("modalInputLink").value = "";
     document.getElementById("walletModal").style.display = "flex";
     if(window.innerWidth < 900) {
         document.getElementById("menuDrawer").classList.remove("open");
@@ -3395,9 +3403,11 @@ function openDepositModal() {
 
 function openWithdrawModal() {
     modalType = 'withdraw';
-    document.getElementById("modalTitle").innerText = "Withdraw Funds (Min 1,000 KES)";
+    document.getElementById("modalTitle").innerText = "Withdraw Funds (Min. KSh 1,000)";
     document.getElementById("modalDesc").innerText = "Enter your M-Pesa phone number for payout:";
+    document.getElementById("amountLabel").innerText = "Withdrawal Amount (KES):";
     document.getElementById("modalInputAmount").value = "1000";
+    document.getElementById("modalInputLink").value = "";
     document.getElementById("walletModal").style.display = "flex";
     if(window.innerWidth < 900) {
         document.getElementById("menuDrawer").classList.remove("open");
@@ -3410,10 +3420,12 @@ function closeModal() {
 
 async function submitModalAction() {
     let amount = parseFloat(document.getElementById("modalInputAmount").value) || 0;
-    let linkOrPhone = document.getElementById("modalInputLink").value;
+    let linkOrPhone = document.getElementById("modalInputLink").value.trim();
     
     if(modalType === 'deposit') {
         if(amount < 200) { alert("Minimum deposit is KSh 200."); return; }
+        if(!linkOrPhone) { alert("Please paste your M-Pesa prompt link or enter your phone number."); return; }
+        
         let res = await fetch('/api/confirm-deposit', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -3425,6 +3437,8 @@ async function submitModalAction() {
         fetchState();
     } else {
         if(amount < 1000) { alert("Minimum withdrawal is KSh 1,000."); return; }
+        if(!linkOrPhone) { alert("Please enter your M-Pesa phone number."); return; }
+        
         let res = await fetch('/api/withdraw', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
