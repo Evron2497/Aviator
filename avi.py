@@ -4270,15 +4270,639 @@
 #     app.run(host="0.0.0.0", port=5000, debug=True)
 
 
+import os
+import time
+import random
+import sqlite3
+import hashlib
+import secrets
+import threading
+from datetime import datetime
+
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    session,
+    redirect,
+    render_template_string,
+)
+
+# ============================================================
+# CONFIGURATION & RULES
+# ============================================================
+
+DB_NAME = "aviator_live.db"
+
+BETTING_WINDOW = 3.0
+MAX_BETS = 2
+MIN_DEPOSIT = 100.0
+MIN_WITHDRAWAL = 100.0
+CRASH_DISPLAY_TIME = 1.0
+STARTING_BALANCE = 10000.0
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+GAME_LOCK = threading.RLock()
 
 
+# ============================================================
+# DATABASE SETUP
+# ============================================================
+
+def get_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def verify_password(password, hashed):
+    return secrets.compare_digest(hash_password(password), hashed)
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            phone_number TEXT UNIQUE NOT NULL,
+            balance REAL DEFAULT 10000.0,
+            role TEXT DEFAULT 'USER',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crash_point REAL NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            round_id INTEGER NOT NULL,
+            bet_number INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            auto_cashout REAL,
+            cashout_multiplier REAL,
+            winnings REAL DEFAULT 0,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS password_resets (
+            phone_number TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            expires_at REAL NOT NULL
+        )
+    """)
+
+    admin = conn.execute("SELECT id FROM users WHERE username = ?", ("EVRON",)).fetchone()
+    if not admin:
+        conn.execute("""
+            INSERT INTO users (username, password, phone_number, balance, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            "EVRON",
+            hash_password("61782497"),
+            "254700000000",
+            100000.0,
+            "ADMIN",
+            datetime.now().isoformat()
+        ))
+    else:
+        conn.execute("UPDATE users SET role = 'ADMIN' WHERE username = ?", ("EVRON",))
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# GAME ENGINE & ACCELERATION CURVE
+# ============================================================
+
+def generate_crash_point():
+    value = random.random()
+    if value < 0.04:
+        return round(random.uniform(1.00, 1.08), 2)
+    elif value < 0.25:
+        return round(random.uniform(1.09, 2.15), 2)
+    elif value < 0.65:
+        return round(random.uniform(2.16, 6.50), 2)
+    elif value < 0.90:
+        return round(random.uniform(6.51, 25.00), 2)
+    return round(random.uniform(25.00, 150.00), 2)
+
+
+def calculate_multiplier(elapsed):
+    multiplier = 1.0 + (elapsed * 0.45) + ((elapsed ** 1.65) * 0.12)
+    return round(multiplier, 2)
+
+
+GAME = {
+    "round_id": None,
+    "crash_point": None,
+    "next_crash_points": [generate_crash_point(), generate_crash_point()],
+    "status": "WAITING",
+    "betting_start": None,
+    "run_start": None,
+    "current_multiplier": 1.00,
+    "crash_time": None,
+    "multiplier_history": [2.45, 1.12, 5.80, 1.02, 3.14, 1.45, 12.40, 1.00, 2.10, 4.35],
+    "bot_bets": []
+}
+
+FIRST_NAMES = [
+    "alex", "brian", "coll", "david", "eric", "frank", "grace", "harr", "ian", "john",
+    "kevin", "lucy", "mike", "nick", "oliver", "peter", "queen", "ray", "sam", "tom",
+    "victor", "wendy", "xav", "yves", "zack", "kelv", "sylv", "mash", "kip", "wanj",
+    "njeri", "ochi", "otien", "maina", "chep", "kiprot", "kibet", "kipko", "cherot"
+]
+
+def generate_bot_bets():
+    bets = []
+    count = random.randint(35, 55)
+    for i in range(count):
+        prefix = random.choice(FIRST_NAMES)
+        masked = prefix[:3] + "***" + str(random.randint(0, 9))
+        amount = round(random.choice([50, 100, 200, 500, 1000, 2500, 5000]), 2)
+        target_cashout = round(random.uniform(1.10, 12.00), 2) if random.random() > 0.15 else None
+        
+        bets.append({
+            "id": f"bot_{i}",
+            "username": masked,
+            "amount": amount,
+            "auto_cashout": target_cashout,
+            "status": "ACTIVE",
+            "cashout_multiplier": None,
+            "winnings": 0.0,
+            "cashedOut": False,
+            "cashoutAmount": 0.0
+        })
+    return bets
+
+
+def create_round_locked():
+    crash_point = GAME["next_crash_points"].pop(0)
+    GAME["next_crash_points"].append(generate_crash_point())
+
+    now = datetime.now().isoformat()
+    conn = get_db()
+    cursor = conn.execute("INSERT INTO rounds (crash_point, started_at) VALUES (?, ?)", (crash_point, now))
+    round_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    GAME["round_id"] = round_id
+    GAME["crash_point"] = crash_point
+    GAME["status"] = "WAITING"
+    GAME["betting_start"] = time.time()
+    GAME["run_start"] = None
+    GAME["current_multiplier"] = 1.00
+    GAME["crash_time"] = None
+    GAME["bot_bets"] = generate_bot_bets()
+
+
+def initialize_game():
+    with GAME_LOCK:
+        if GAME["round_id"] is None:
+            create_round_locked()
+
+
+def start_running_locked():
+    if GAME["status"] != "WAITING":
+        return
+    GAME["status"] = "FLYING"
+    GAME["run_start"] = time.time()
+    GAME["current_multiplier"] = 1.00
+
+
+def process_auto_cashouts_and_bets_locked():
+    if GAME["status"] != "FLYING":
+        return
+
+    multiplier = GAME["current_multiplier"]
+    crash_point = GAME["crash_point"]
+    round_id = GAME["round_id"]
+
+    if multiplier >= crash_point:
+        return
+
+    for bot in GAME["bot_bets"]:
+        if not bot["cashedOut"] and bot["auto_cashout"] and bot["auto_cashout"] <= multiplier and bot["auto_cashout"] < crash_point:
+            bot["cashedOut"] = True
+            bot["cashout_multiplier"] = bot["auto_cashout"]
+            bot["cashoutAmount"] = round(bot["amount"] * bot["auto_cashout"], 2)
+
+    for bot in GAME["bot_bets"]:
+        if not bot["cashedOut"] and not bot["auto_cashout"] and multiplier > 1.20:
+            if random.random() < 0.06:
+                bot["cashedOut"] = True
+                bot["cashout_multiplier"] = multiplier
+                bot["cashoutAmount"] = round(bot["amount"] * multiplier, 2)
+
+    conn = get_db()
+    bets = conn.execute("""
+        SELECT * FROM bets
+        WHERE round_id = ? AND status = 'ACTIVE' AND auto_cashout IS NOT NULL
+    """, (round_id,)).fetchall()
+
+    for bet in bets:
+        target = float(bet["auto_cashout"])
+        if target <= multiplier and target < crash_point:
+            winnings = round(float(bet["amount"]) * target, 2)
+            cursor = conn.execute("""
+                UPDATE bets
+                SET status = 'WON', cashout_multiplier = ?, winnings = ?
+                WHERE id = ? AND status = 'ACTIVE'
+            """, (target, winnings, bet["id"]))
+
+            if cursor.rowcount == 1:
+                conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (winnings, bet["username"]))
+
+    conn.commit()
+    conn.close()
+
+
+def crash_round_locked():
+    if GAME["status"] == "CRASHED":
+        return
+
+    GAME["status"] = "CRASHED"
+    GAME["current_multiplier"] = GAME["crash_point"]
+    GAME["crash_time"] = time.time()
+
+    GAME["multiplier_history"].append(GAME["crash_point"])
+    if len(GAME["multiplier_history"]) > 20:
+        GAME["multiplier_history"].pop(0)
+
+    for bot in GAME["bot_bets"]:
+        if not bot["cashedOut"]:
+            bot["status"] = "LOST"
+
+    conn = get_db()
+    conn.execute("UPDATE bets SET status = 'LOST' WHERE round_id = ? AND status = 'ACTIVE'", (GAME["round_id"],))
+    conn.execute("UPDATE rounds SET ended_at = ? WHERE id = ?", (datetime.now().isoformat(), GAME["round_id"]))
+    conn.commit()
+    conn.close()
+
+
+def tick_game_locked():
+    initialize_game()
+    now = time.time()
+
+    if GAME["status"] == "WAITING":
+        elapsed = now - GAME["betting_start"]
+        GAME["current_multiplier"] = 1.00
+        if elapsed >= BETTING_WINDOW:
+            start_running_locked()
+
+    elif GAME["status"] == "FLYING":
+        elapsed = now - GAME["run_start"]
+        multiplier = calculate_multiplier(elapsed)
+        GAME["current_multiplier"] = multiplier
+        process_auto_cashouts_and_bets_locked()
+
+        if multiplier >= GAME["crash_point"]:
+            crash_round_locked()
+
+    elif GAME["status"] == "CRASHED":
+        if GAME["crash_time"] is not None and (now - GAME["crash_time"]) >= CRASH_DISPLAY_TIME:
+            create_round_locked()
+
+
+def game_loop():
+    while True:
+        try:
+            with GAME_LOCK:
+                tick_game_locked()
+        except Exception as e:
+            print("Game engine error:", e)
+        time.sleep(0.03)
+
+
+threading.Thread(target=game_loop, daemon=True).start()
+init_db()
+
+
+# ============================================================
+# FLASK API & TEMPLATE ROUTING
+# ============================================================
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    phone = data.get("phone", "").strip()
+    password = data.get("pass", "").strip()
+
+    if not name or not phone or not password:
+        return jsonify({"success": False, "message": "All fields are required."}), 400
+
+    conn = get_db()
+    existing = conn.execute("SELECT id FROM users WHERE phone_number = ? OR username = ?", (phone, name)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"success": False, "message": "User or phone number already registered."}), 400
+
+    hashed = hash_password(password)
+    now = datetime.now().isoformat()
+    conn.execute("""
+        INSERT INTO users (username, password, phone_number, balance, role, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (name, hashed, phone, STARTING_BALANCE, "USER", now))
+    conn.commit()
+    user = conn.execute("SELECT username, phone_number, balance, role FROM users WHERE username = ?", (name,)).fetchone()
+    conn.close()
+
+    session["username"] = user["username"]
+    return jsonify({
+        "success": True,
+        "user": {
+            "name": user["username"],
+            "phone": user["phone_number"],
+            "balance": user["balance"],
+            "isAdmin": user["role"] == "ADMIN"
+        }
+    })
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json or {}
+    user_inp = data.get("user", "").strip()
+    pass_inp = data.get("pass", "").strip()
+
+    if not user_inp or not pass_inp:
+        return jsonify({"success": False, "message": "Invalid username or password."}), 400
+
+    conn = get_db()
+    user = conn.execute("""
+        SELECT * FROM users WHERE username = ? OR phone_number = ?
+    """, (user_inp, user_inp)).fetchone()
+    conn.close()
+
+    if not user or not verify_password(pass_inp, user["password"]):
+        return jsonify({"success": False, "message": "Invalid credentials."}), 400
+
+    session["username"] = user["username"]
+    return jsonify({
+        "success": True,
+        "user": {
+            "name": user["username"],
+            "phone": user["phone_number"],
+            "balance": user["balance"],
+            "isAdmin": user["role"] == "ADMIN"
+        }
+    })
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.pop("username", None)
+    return jsonify({"success": True})
+
+
+@app.route("/api/state", methods=["GET"])
+def api_state():
+    username = session.get("username")
+    user_data = {"balance": STARTING_BALANCE, "name": "Player", "isAdmin": False}
+    
+    user_bets = []
+    if username:
+        conn = get_db()
+        u = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if u:
+            user_data = {
+                "name": u["username"],
+                "phone": u["phone_number"],
+                "balance": u["balance"],
+                "isAdmin": u["role"] == "ADMIN"
+            }
+        
+        with GAME_LOCK:
+            current_round = GAME["round_id"]
+        
+        if current_round:
+            b_rows = conn.execute("SELECT * FROM bets WHERE username = ? AND round_id = ?", (username, current_round)).fetchall()
+            for br in b_rows:
+                user_bets.append({
+                    "betNumber": br["bet_number"],
+                    "amount": br["amount"],
+                    "autoEnabled": br["auto_cashout"] is not None,
+                    "autoMultiplier": br["auto_cashout"] or 2.0,
+                    "active": br["status"] == "ACTIVE",
+                    "cashedOut": br["status"] == "WON",
+                    "cashoutValue": br["winnings"]
+                })
+        conn.close()
+
+    with GAME_LOCK:
+        game_payload = {
+            "status": GAME["status"],
+            "currentMultiplier": GAME["current_multiplier"],
+            "crashPoint": GAME["crash_point"] if GAME["status"] == "CRASHED" else None,
+            "history": GAME["multiplier_history"],
+            "botBets": GAME["bot_bets"],
+            "nextPreview": GAME["next_point_preview"] if "next_point_preview" in GAME else GAME["next_crash_points"][0]
+        }
+
+    return jsonify({
+        "success": True,
+        "user": user_data,
+        "userBets": user_bets,
+        "game": game_payload
+    })
+
+
+@app.route("/api/bet", methods=["POST"])
+def api_bet():
+    username = session.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Not logged in."}), 401
+
+    data = request.json or {}
+    bet_number = int(data.get("betNumber", 1))
+    amount = float(data.get("amount", 10.0))
+    auto_enabled = bool(data.get("autoEnabled", False))
+    auto_mult = float(data.get("autoMultiplier", 2.0))
+
+    with GAME_LOCK:
+        if GAME["status"] == "CRASHED":
+            return jsonify({"success": False, "message": "Round has ended. Wait for next round."}), 400
+        round_id = GAME["round_id"]
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not user or user["balance"] < amount:
+        conn.close()
+        return jsonify({"success": False, "message": "Insufficient balance."}), 400
+
+    # Deduct balance & place bet
+    conn.execute("UPDATE users SET balance = balance - ? WHERE username = ?", (amount, username))
+    
+    # Check if existing bet for this round/bet_number exists
+    existing_bet = conn.execute("SELECT * FROM bets WHERE username = ? AND round_id = ? AND bet_number = ?", (username, round_id, bet_number)).fetchone()
+    
+    if existing_bet:
+        if existing_bet["status"] == "ACTIVE":
+            # Refund & cancel
+            conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount + existing_bet["amount"], username))
+            conn.execute("DELETE FROM bets WHERE id = ?", (existing_bet["id"],))
+            conn.commit()
+            conn.close()
+            return jsonify({"success": True, "action": "CANCELLED"})
+        else:
+            conn.close()
+            return jsonify({"success": False, "message": "Bet already settled."}), 400
+
+    now = datetime.now().isoformat()
+    conn.execute("""
+        INSERT INTO bets (username, round_id, bet_number, amount, auto_cashout, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (username, round_id, bet_number, amount, auto_mult if auto_enabled else None, "ACTIVE", now))
+    conn.commit()
+    
+    updated_user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+
+    return jsonify({"success": True, "action": "PLACED", "balance": updated_user["balance"]})
+
+
+@app.route("/api/cashout", methods=["POST"])
+def api_cashout():
+    username = session.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Not logged in."}), 401
+
+    data = request.json or {}
+    bet_number = int(data.get("betNumber", 1))
+
+    with GAME_LOCK:
+        if GAME["status"] != "FLYING":
+            return jsonify({"success": False, "message": "Flight is not active."}), 400
+        current_mult = GAME["current_multiplier"]
+        round_id = GAME["round_id"]
+
+    conn = get_db()
+    bet = conn.execute("""
+        SELECT * FROM bets WHERE username = ? AND round_id = ? AND bet_number = ? AND status = 'ACTIVE'
+    """, (username, round_id, bet_number)).fetchone()
+
+    if not bet:
+        conn.close()
+        return jsonify({"success": False, "message": "Active bet not found."}), 400
+
+    winnings = round(bet["amount"] * current_mult, 2)
+    conn.execute("""
+        UPDATE bets
+        SET status = 'WON', cashout_multiplier = ?, winnings = ?
+        WHERE id = ?
+    """, (current_mult, winnings, bet["id"]))
+    conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (winnings, username))
+    conn.commit()
+
+    updated_user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+
+    return jsonify({"success": True, "winnings": winnings, "multiplier": current_mult, "balance": updated_user["balance"]})
+
+
+@app.route("/api/deposit", methods=["POST"])
+def api_deposit():
+    username = session.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Not logged in."}), 401
+
+    data = request.json or {}
+    amount = float(data.get("amount", 1000.0))
+
+    conn = get_db()
+    conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount, username))
+    user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "balance": user["balance"]})
+
+
+@app.route("/api/withdraw", methods=["POST"])
+def api_withdraw():
+    username = session.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Not logged in."}), 401
+
+    data = request.json or {}
+    amount = float(data.get("amount", 1000.0))
+
+    conn = get_db()
+    user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
+    if not user or user["balance"] < amount:
+        conn.close()
+        return jsonify({"success": False, "message": "Insufficient balance."}), 400
+
+    conn.execute("UPDATE users SET balance = balance - ? WHERE username = ?", (amount, username))
+    updated = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "balance": updated["balance"]})
+
+
+@app.route("/api/admin/override", methods=["POST"])
+def api_admin_override():
+    username = session.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Unauthorized."}), 401
+
+    conn = get_db()
+    user = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+
+    if not user or user["role"] != "ADMIN":
+        return jsonify({"success": False, "message": "Admin access required."}), 403
+
+    data = request.json or {}
+    val = float(data.get("multiplier", 2.0))
+
+    with GAME_LOCK:
+        GAME["next_crash_points"][0] = val
+
+    return jsonify({"success": True, "nextMultiplier": val})
+
+
+# ============================================================
+# FRONTEND HTML TEMPLATE
+# ============================================================
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aviator Flight Game</title>
-    <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -4297,9 +4921,7 @@
             }
         }
     </script>
-    <!-- FontAwesome for Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
         body {
@@ -4308,7 +4930,6 @@
             color: #f7fafc;
             overflow-x: hidden;
         }
-        /* Custom scrollbar */
         ::-webkit-scrollbar {
             width: 6px;
             height: 6px;
@@ -4327,6 +4948,7 @@
 </head>
 <body class="min-h-screen flex flex-col justify-between bg-darkBg text-white">
 
+    <!-- AUTH MODAL -->
     <div id="auth-modal" class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
         <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col space-y-5">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
@@ -4338,7 +4960,6 @@
                 </div>
             </div>
 
-            <!-- TAB SWITCHER -->
             <div class="grid grid-cols-2 bg-cardBg p-1 rounded-xl border border-gray-700 text-xs font-bold">
                 <button onclick="switchAuthTab('login')" id="auth-tab-login" class="py-2.5 rounded-lg bg-blue-600 text-white transition">Login</button>
                 <button onclick="switchAuthTab('register')" id="auth-tab-register" class="py-2.5 rounded-lg text-gray-400 hover:text-white transition">Register</button>
@@ -4347,15 +4968,12 @@
             <!-- LOGIN FORM -->
             <div id="form-login" class="flex flex-col space-y-4">
                 <div class="flex flex-col space-y-1">
-                    <label class="text-xs text-gray-400 font-medium">Username or Phone Number:</label>
-                    <input id="login-user" type="text" placeholder="e.g. 0712345678 or admin" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
+                    <label class="text-xs text-gray-400 font-medium">Username or Phone Number (Admin: EVRON):</label>
+                    <input id="login-user" type="text" placeholder="e.g. EVRON or 0712345678" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
                 </div>
                 <div class="flex flex-col space-y-1">
                     <label class="text-xs text-gray-400 font-medium">Password:</label>
                     <input id="login-pass" type="password" placeholder="••••••••" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
-                </div>
-                <div class="flex justify-end">
-                    <button onclick="switchAuthTab('forgot')" class="text-xs text-blue-400 hover:underline">Forgot Password?</button>
                 </div>
                 <button onclick="submitLogin()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl shadow-lg transition text-sm uppercase">
                     Login to Flight
@@ -4365,8 +4983,8 @@
             <!-- REGISTER FORM -->
             <div id="form-register" class="flex flex-col space-y-4 hidden">
                 <div class="flex flex-col space-y-1">
-                    <label class="text-xs text-gray-400 font-medium">Full Name:</label>
-                    <input id="reg-name" type="text" placeholder="John Doe" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
+                    <label class="text-xs text-gray-400 font-medium">Username:</label>
+                    <input id="reg-name" type="text" placeholder="JohnDoe" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
                 </div>
                 <div class="flex flex-col space-y-1">
                     <label class="text-xs text-gray-400 font-medium">M-PESA Phone Number:</label>
@@ -4380,31 +4998,10 @@
                     Register Account & Get 10,000 KES
                 </button>
             </div>
-
-            <!-- FORGOT PASSWORD FORM (USSD) -->
-            <div id="form-forgot" class="flex flex-col space-y-4 hidden">
-                <div class="flex flex-col space-y-1">
-                    <label class="text-xs text-gray-400 font-medium">Enter Registered Phone Number:</label>
-                    <input id="forgot-phone" type="text" placeholder="+254 712 345 678" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none">
-                </div>
-                <button onclick="requestUssdReset()" class="w-full bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 rounded-xl shadow-lg transition text-sm uppercase">
-                    Send USSD Reset Code
-                </button>
-                <div id="ussd-simulation-box" class="hidden bg-cardBg border border-purple-800/60 p-3 rounded-xl text-xs space-y-2">
-                    <div class="font-bold text-purple-300"><i class="fa-solid fa-mobile-screen"></i> USSD Gateway Simulator</div>
-                    <div id="ussd-message-text" class="text-gray-300 font-mono bg-black/40 p-2 rounded border border-gray-800"></div>
-                    <div class="flex space-x-2">
-                        <input id="ussd-input-pin" type="text" placeholder="Enter new password" class="w-full bg-gray-900 border border-gray-700 px-2 py-1.5 rounded text-white">
-                        <button onclick="confirmUssdReset()" class="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded font-bold text-white">Confirm</button>
-                    </div>
-                </div>
-                <div class="flex justify-center">
-                    <button onclick="switchAuthTab('login')" class="text-xs text-gray-400 hover:text-white"><i class="fa-solid fa-arrow-left"></i> Back to Login</button>
-                </div>
-            </div>
         </div>
     </div>
 
+    <!-- HEADER -->
     <header class="bg-panelBg border-b border-gray-800 px-4 py-3 flex items-center justify-between shadow-lg relative z-40">
         <div class="flex items-center space-x-3">
             <div class="bg-red-600 p-2 rounded-xl text-white font-black text-xl flex items-center justify-center shadow-md">
@@ -4424,13 +5021,12 @@
                 <i class="fa-solid fa-plus-circle"></i>
                 <span class="hidden sm:inline">Deposit</span>
             </button>
-            <!-- Hamburger Menu Button -->
             <button onclick="toggleMenu()" class="bg-cardBg hover:bg-gray-700 border border-gray-700 p-2.5 rounded-xl text-gray-300 transition shadow">
                 <i class="fa-solid fa-bars"></i>
             </button>
         </div>
 
-        <!-- Dropdown Menu -->
+        <!-- DROPDOWN MENU -->
         <div id="dropdown-menu" class="hidden absolute top-16 right-4 w-64 bg-panelBg border border-gray-700 rounded-2xl shadow-2xl p-3 flex flex-col space-y-2 z-50">
             <div class="flex items-center justify-between pb-2 border-b border-gray-800">
                 <span class="font-bold text-sm text-gray-200">Menu</span>
@@ -4448,20 +5044,6 @@
                 <i class="fa-solid fa-shield-halved w-5"></i>
                 <span>Admin Dashboard</span>
             </button>
-            <div class="flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-cardBg text-gray-300 text-sm font-medium">
-                <div class="flex items-center space-x-3">
-                    <i class="fa-solid fa-volume-high text-yellow-400 w-5"></i>
-                    <span>Sound Effects</span>
-                </div>
-                <input type="checkbox" id="sound-toggle" checked onchange="toggleSound()" class="accent-blue-600 w-4 h-4 cursor-pointer">
-            </div>
-            <div class="flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-cardBg text-gray-300 text-sm font-medium">
-                <div class="flex items-center space-x-3">
-                    <i class="fa-solid fa-music text-purple-400 w-5"></i>
-                    <span>Flight Music</span>
-                </div>
-                <input type="checkbox" id="music-toggle" checked onchange="toggleMusic()" class="accent-blue-600 w-4 h-4 cursor-pointer">
-            </div>
             <button onclick="logoutUser()" class="flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-red-950/40 text-red-400 transition text-sm font-medium border-t border-gray-800 mt-2">
                 <i class="fa-solid fa-right-from-bracket w-5"></i>
                 <span>Logout</span>
@@ -4469,26 +5051,21 @@
         </div>
     </header>
 
+    <!-- MAIN GAME AREA -->
     <main class="flex-1 max-w-7xl w-full mx-auto p-2 sm:p-4 grid grid-cols-1 lg:grid-cols-12 gap-4">
         
-        <!-- Main Flight Area & Multiplier Display (Takes 8 cols on large screens) -->
         <section class="lg:col-span-8 flex flex-col space-y-4">
             
-            <!-- Multiplier History Bar -->
+            <!-- HISTORY BAR -->
             <div id="history-bar" class="bg-panelBg rounded-xl border border-gray-800 px-3 py-2 flex items-center space-x-2 overflow-x-auto whitespace-nowrap shadow-md">
                 <span class="text-xs text-gray-500 font-semibold uppercase tracking-wider mr-1">History:</span>
-                <!-- Multipliers injected here -->
             </div>
 
-            <!-- Canvas Flight Arena -->
+            <!-- CANVAS FLIGHT ARENA -->
             <div class="relative bg-gradient-to-b from-panelBg via-cardBg to-panelBg rounded-2xl border border-gray-800 h-[300px] sm:h-[380px] flex flex-col items-center justify-center overflow-hidden shadow-2xl">
-                <!-- Grid pattern background overlay -->
                 <div class="absolute inset-0 opacity-10 bg-[radial-gradient(#e53e3e_1px,transparent_1px)] [background-size:16px_16px]"></div>
-
-                <!-- Canvas for Flight Curve Animation -->
                 <canvas id="flight-canvas" class="absolute inset-0 w-full h-full z-0"></canvas>
 
-                <!-- Center Game Status Message / Multiplier -->
                 <div id="game-status-container" class="z-10 flex flex-col items-center justify-center text-center p-4">
                     <div id="multiplier-display" class="text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight transition-all duration-75">
                         1.00x
@@ -4498,12 +5075,12 @@
                     </div>
                 </div>
 
-                <!-- Airplane Icon/Animation indicator -->
                 <div id="airplane-indicator" class="absolute z-20 text-yellow-400 text-3xl sm:text-4xl transition-all duration-75 hidden">
                     <i class="fa-solid fa-plane animate-bounce"></i>
                 </div>
             </div>
 
+            <!-- BET PANELS -->
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 
                 <!-- BET PANEL 1 -->
@@ -4511,26 +5088,24 @@
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-sm text-gray-200">BET 1</span>
                         <div class="flex items-center space-x-1 bg-cardBg p-1 rounded-lg border border-gray-700 text-xs">
-                            <button onclick="setTab('bet1', 'manual')" id="bet1-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
-                            <button onclick="setTab('bet1', 'auto')" id="bet1-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
+                            <button onclick="setTab(1, 'manual')" id="bet1-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
+                            <button onclick="setTab(1, 'auto')" id="bet1-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
                         </div>
                     </div>
 
                     <div class="grid grid-cols-2 gap-3">
-                        <!-- Amount Control -->
                         <div class="flex flex-col space-y-1">
                             <div class="flex justify-between text-xs text-gray-400 font-medium">
                                 <span>Amount (KES)</span>
-                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet('bet1', 100)">+100</span>
+                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet(1, 100)">+100</span>
                             </div>
                             <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <button onclick="changeBetAmount('bet1', -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
+                                <button onclick="changeBetAmount(1, -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
                                 <input id="bet1-amount" type="number" value="10.00" min="10" step="10" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <button onclick="changeBetAmount('bet1', 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
+                                <button onclick="changeBetAmount(1, 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
                             </div>
                         </div>
 
-                        <!-- Auto Cashout Control -->
                         <div class="flex flex-col space-y-1">
                             <div class="flex items-center justify-between text-xs text-gray-400 font-medium">
                                 <span>Auto Cash Out</span>
@@ -4543,21 +5118,17 @@
                         </div>
                     </div>
 
-                    <!-- Quick Preset Buttons -->
                     <div class="grid grid-cols-4 gap-1.5 pt-1">
-                        <button onclick="setPresetBet('bet1', 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
-                        <button onclick="setPresetBet('bet1', 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
-                        <button onclick="setPresetBet('bet1', 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
-                        <button onclick="setPresetBet('bet1', 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
+                        <button onclick="setPresetBet(1, 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
+                        <button onclick="setPresetBet(1, 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
+                        <button onclick="setPresetBet(1, 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
+                        <button onclick="setPresetBet(1, 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
                     </div>
 
-                    <!-- Action Button 1 (Green top / Red bottom styling requested) -->
                     <div class="flex flex-col space-y-1">
-                        <div class="text-[10px] text-emerald-400 font-bold uppercase tracking-wider text-center">Secure Entry</div>
                         <button id="bet1-action-btn" onclick="handleBetClick(1)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase">
                             <span>BET</span>
                         </button>
-                        <div class="text-[10px] text-red-400 font-bold uppercase tracking-wider text-center">High Risk Exit</div>
                     </div>
                     <div id="bet1-live-win" class="hidden text-center text-xs text-yellow-400 font-bold bg-yellow-950/40 py-1.5 rounded-lg border border-yellow-800/40">
                         Live Winnings: <span id="bet1-win-amount">0.00</span> KES (<span id="bet1-live-mult">1.00x</span>)
@@ -4569,26 +5140,24 @@
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-sm text-gray-200">BET 2</span>
                         <div class="flex items-center space-x-1 bg-cardBg p-1 rounded-lg border border-gray-700 text-xs">
-                            <button onclick="setTab('bet2', 'manual')" id="bet2-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
-                            <button onclick="setTab('bet2', 'auto')" id="bet2-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
+                            <button onclick="setTab(2, 'manual')" id="bet2-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
+                            <button onclick="setTab(2, 'auto')" id="bet2-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
                         </div>
                     </div>
 
                     <div class="grid grid-cols-2 gap-3">
-                        <!-- Amount Control -->
                         <div class="flex flex-col space-y-1">
                             <div class="flex justify-between text-xs text-gray-400 font-medium">
                                 <span>Amount (KES)</span>
-                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet('bet2', 100)">+100</span>
+                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet(2, 100)">+100</span>
                             </div>
                             <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <button onclick="changeBetAmount('bet2', -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
+                                <button onclick="changeBetAmount(2, -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
                                 <input id="bet2-amount" type="number" value="10.00" min="10" step="10" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <button onclick="changeBetAmount('bet2', 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
+                                <button onclick="changeBetAmount(2, 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
                             </div>
                         </div>
 
-                        <!-- Auto Cashout Control -->
                         <div class="flex flex-col space-y-1">
                             <div class="flex items-center justify-between text-xs text-gray-400 font-medium">
                                 <span>Auto Cash Out</span>
@@ -4601,21 +5170,17 @@
                         </div>
                     </div>
 
-                    <!-- Quick Preset Buttons -->
                     <div class="grid grid-cols-4 gap-1.5 pt-1">
-                        <button onclick="setPresetBet('bet2', 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
-                        <button onclick="setPresetBet('bet2', 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
-                        <button onclick="setPresetBet('bet2', 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
-                        <button onclick="setPresetBet('bet2', 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
+                        <button onclick="setPresetBet(2, 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
+                        <button onclick="setPresetBet(2, 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
+                        <button onclick="setPresetBet(2, 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
+                        <button onclick="setPresetBet(2, 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
                     </div>
 
-                    <!-- Action Button 2 (Green top / Red bottom styling requested) -->
                     <div class="flex flex-col space-y-1">
-                        <div class="text-[10px] text-emerald-400 font-bold uppercase tracking-wider text-center">Secure Entry</div>
                         <button id="bet2-action-btn" onclick="handleBetClick(2)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase">
                             <span>BET</span>
                         </button>
-                        <div class="text-[10px] text-red-400 font-bold uppercase tracking-wider text-center">High Risk Exit</div>
                     </div>
                     <div id="bet2-live-win" class="hidden text-center text-xs text-yellow-400 font-bold bg-yellow-950/40 py-1.5 rounded-lg border border-yellow-800/40">
                         Live Winnings: <span id="bet2-win-amount">0.00</span> KES (<span id="bet2-live-mult">1.00x</span>)
@@ -4626,61 +5191,49 @@
 
         </section>
 
-        <!-- Live Players & User Bets Sidebar -->
+        <!-- LIVE PLAYERS SIDEBAR -->
         <section class="lg:col-span-4 bg-panelBg rounded-2xl border border-gray-800 p-4 flex flex-col h-[350px] lg:h-auto shadow-xl">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
                 <h2 class="font-bold text-sm uppercase tracking-wider text-gray-300 flex items-center space-x-2">
                     <i class="fa-solid fa-users text-blue-400"></i>
                     <span>All Bets & Players</span>
                 </h2>
-                <span id="live-count" class="bg-blue-900/60 text-blue-300 text-xs px-2 py-0.5 rounded-full font-semibold">42 Online</span>
+                <span id="live-count" class="bg-blue-900/60 text-blue-300 text-xs px-2 py-0.5 rounded-full font-semibold">Online</span>
             </div>
             
-            <!-- Player Bets Feed Header -->
             <div class="grid grid-cols-3 text-xs text-gray-400 font-semibold py-2 border-b border-gray-800/50">
                 <span>User</span>
                 <span class="text-center">Bet (KES)</span>
                 <span class="text-right">Cashed Out</span>
             </div>
 
-            <!-- Scrollable Player List -->
             <div id="live-players-list" class="flex-1 overflow-y-auto space-y-2 py-2 pr-1 text-xs">
-                <!-- Dynamically populated -->
             </div>
         </section>
 
     </main>
 
-    <!-- Deposit Modal with Prompt Link -->
+    <!-- DEPOSIT MODAL -->
     <div id="deposit-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
         <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
                 <h3 class="font-bold text-base text-white flex items-center space-x-2">
                     <i class="fa-solid fa-wallet text-emerald-400"></i>
-                    <span>Deposit Funds (KES)</span>
+                    <span>Deposit via M-PESA</span>
                 </h3>
                 <button onclick="closeDepositModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
-            </div>
-            <div class="flex flex-col space-y-2">
-                <label class="text-xs text-gray-400 font-medium">Paste Payment Prompt Link / M-PESA Code:</label>
-                <input id="deposit-prompt-link" type="text" placeholder="https://pay.gateway.com/prompt/... or QG89XYZ123" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none font-mono">
             </div>
             <div class="flex flex-col space-y-2">
                 <label class="text-xs text-gray-400 font-medium">Amount to Deposit (KES):</label>
                 <input id="deposit-amount-input" type="number" value="1000" min="100" step="100" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-sm font-bold text-white focus:outline-none">
             </div>
-            <div class="grid grid-cols-3 gap-2">
-                <button onclick="setDepositAmount(500)" class="bg-cardBg hover:bg-gray-700 border border-gray-700 py-1.5 rounded-lg text-xs font-semibold">500</button>
-                <button onclick="setDepositAmount(1000)" class="bg-cardBg hover:bg-gray-700 border border-gray-700 py-1.5 rounded-lg text-xs font-semibold">1,000</button>
-                <button onclick="setDepositAmount(5000)" class="bg-cardBg hover:bg-gray-700 border border-gray-700 py-1.5 rounded-lg text-xs font-semibold">5,000</button>
-            </div>
             <button onclick="submitDeposit()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl shadow-lg transition text-sm uppercase">
-                Confirm & Deposit
+                Confirm Deposit
             </button>
         </div>
     </div>
 
-    <!-- Withdraw Modal -->
+    <!-- WITHDRAW MODAL -->
     <div id="withdraw-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
         <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
@@ -4689,10 +5242,6 @@
                     <span>Withdraw Funds (KES)</span>
                 </h3>
                 <button onclick="closeWithdrawModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
-            </div>
-            <div class="flex flex-col space-y-2">
-                <label class="text-xs text-gray-400 font-medium">M-PESA Phone Number:</label>
-                <input id="withdraw-phone" type="text" value="+254 712 345 678" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none font-mono">
             </div>
             <div class="flex flex-col space-y-2">
                 <label class="text-xs text-gray-400 font-medium">Withdrawal Amount (KES):</label>
@@ -4704,7 +5253,7 @@
         </div>
     </div>
 
-    <!-- Profile Modal -->
+    <!-- PROFILE MODAL -->
     <div id="profile-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
         <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
@@ -4716,20 +5265,12 @@
             </div>
             <div class="grid grid-cols-2 gap-3 text-xs">
                 <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Total Wagered</div>
-                    <div id="stat-wagered" class="text-sm font-bold text-white mt-1">0.00 KES</div>
+                    <div class="text-gray-400">Account Username</div>
+                    <div id="stat-username" class="text-sm font-bold text-white mt-1">Player</div>
                 </div>
                 <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Total Won</div>
-                    <div id="stat-won" class="text-sm font-bold text-emerald-400 mt-1">0.00 KES</div>
-                </div>
-                <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Rounds Played</div>
-                    <div id="stat-rounds" class="text-sm font-bold text-white mt-1">0</div>
-                </div>
-                <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Highest Multiplier</div>
-                    <div id="stat-highest" class="text-sm font-bold text-yellow-400 mt-1">1.00x</div>
+                    <div class="text-gray-400">Balance</div>
+                    <div id="stat-balance" class="text-sm font-bold text-emerald-400 mt-1">0.00 KES</div>
                 </div>
             </div>
             <button onclick="closeProfileModal()" class="w-full bg-gray-700 hover:bg-gray-600 text-white font-bold py-2.5 rounded-xl transition text-xs uppercase">
@@ -4738,7 +5279,7 @@
         </div>
     </div>
 
-    <!-- Admin Dashboard Modal (Next 2 rounds preview) -->
+    <!-- ADMIN MODAL -->
     <div id="admin-modal" class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 hidden flex items-center justify-center p-4">
         <div class="bg-panelBg border border-yellow-600/60 w-full max-w-lg rounded-3xl p-6 shadow-2xl flex flex-col space-y-5">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
@@ -4749,20 +5290,16 @@
                 <button onclick="closeAdminModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="bg-cardBg p-4 rounded-2xl border border-yellow-800/40 space-y-3">
-                <div class="text-xs text-yellow-300 font-bold uppercase tracking-wider"><i class="fa-solid fa-eye"></i> Upcoming Flight Multiplier Previews:</div>
-                <div class="grid grid-cols-2 gap-3 text-center">
+                <div class="text-xs text-yellow-300 font-bold uppercase tracking-wider"><i class="fa-solid fa-eye"></i> Upcoming Flight Multiplier Preview:</div>
+                <div class="grid grid-cols-1 gap-3 text-center">
                     <div class="bg-black/40 p-3 rounded-xl border border-gray-800">
-                        <div class="text-xs text-gray-400">Next Round (Round +1)</div>
+                        <div class="text-xs text-gray-400">Next Round Multiplier</div>
                         <div id="admin-preview-1" class="text-xl font-black text-yellow-400 mt-1">--</div>
-                    </div>
-                    <div class="bg-black/40 p-3 rounded-xl border border-gray-800">
-                        <div class="text-xs text-gray-400">Following Round (Round +2)</div>
-                        <div id="admin-preview-2" class="text-xl font-black text-yellow-400 mt-1">--</div>
                     </div>
                 </div>
             </div>
             <div class="flex flex-col space-y-2">
-                <label class="text-xs text-gray-400 font-medium">Override Next Multiplier (Admin Control):</label>
+                <label class="text-xs text-gray-400 font-medium">Override Next Multiplier:</label>
                 <div class="flex space-x-2">
                     <input id="admin-override-val" type="number" step="0.1" placeholder="e.g. 5.00" class="w-full bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-xs text-white">
                     <button onclick="applyAdminOverride()" class="bg-yellow-600 hover:bg-yellow-500 font-bold px-4 py-2 rounded-xl text-gray-950 text-xs">Set</button>
@@ -4774,7 +5311,7 @@
         </div>
     </div>
 
-    <!-- Notification Toast -->
+    <!-- NOTIFICATION TOAST -->
     <div id="notification-box" class="fixed bottom-6 right-6 z-50 transform translate-y-20 opacity-0 transition-all duration-300 bg-cardBg border border-gray-700 text-white px-5 py-3 rounded-xl shadow-2xl flex items-center space-x-3">
         <div id="notification-icon" class="text-emerald-400 text-lg"><i class="fa-solid fa-circle-check"></i></div>
         <div>
@@ -4784,461 +5321,10 @@
     </div>
 
     <script>
-        // User & Auth State
         let currentUser = null;
-        let registeredUsers = JSON.parse(localStorage.getItem('aviator_users') || '[]');
-        
-        // Game State Variables
-        let userBalance = 10000.00;
-        let gameState = 'WAITING'; // WAITING, FLYING, CRASHED
-        let currentMultiplier = 1.00;
-        let crashMultiplier = 1.00;
-        let nextMultipliers = [2.45, 1.80]; // Queue for next 2 rounds
-        let flightStartTime = 0;
-        let flightDuration = 0;
-        let multiplierHistory = [2.45, 1.12, 5.80, 1.02, 3.14, 1.45, 12.40, 1.00, 2.10, 4.35];
-        
-        // Stats
-        let stats = { wagered: 0, won: 0, rounds: 0, highestMultiplier: 1.00 };
+        let gameStateData = { status: 'WAITING', currentMultiplier: 1.00, history: [], botBets: [] };
+        let userBetsMap = { 1: { active: false, cashedOut: false, amount: 10 }, 2: { active: false, cashedOut: false, amount: 10 } };
 
-        // Audio Settings
-        let soundEnabled = true;
-        let musicEnabled = true;
-        let audioCtx = null;
-
-        // Bet States
-        const bets = {
-            1: { active: false, cashedOut: false, amount: 10, autoEnabled: false, autoMultiplier: 2.00, mode: 'manual' },
-            2: { active: false, cashedOut: false, amount: 10, autoEnabled: false, autoMultiplier: 2.00, mode: 'manual' }
-        };
-
-        // Simulated Live Players List
-        let livePlayers = [];
-        const botNames = ['John_K', 'Wanjiru_99', 'Kiptoo_Pro', 'Amina_X', 'Otieno_B', 'Cheruiyot', 'Maina_Bet', 'Naliaka', 'Omondi_Fly', 'Kimani_001'];
-
-        // --- AUTHENTICATION & USSD FUNCTIONS ---
-        function switchAuthTab(tab) {
-            document.getElementById('form-login').classList.add('hidden');
-            document.getElementById('form-register').classList.add('hidden');
-            document.getElementById('form-forgot').classList.add('hidden');
-            document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
-            document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
-
-            if (tab === 'login') {
-                document.getElementById('form-login').classList.remove('hidden');
-                document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
-                document.getElementById('auth-title').innerText = "AVIATOR LOGIN";
-            } else if (tab === 'register') {
-                document.getElementById('form-register').classList.remove('hidden');
-                document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
-                document.getElementById('auth-title').innerText = "CREATE ACCOUNT";
-            } else if (tab === 'forgot') {
-                document.getElementById('form-forgot').classList.remove('hidden');
-                document.getElementById('auth-title').innerText = "USSD PASSWORD RESET";
-            }
-        }
-
-        function submitRegister() {
-            const name = document.getElementById('reg-name').value.trim();
-            const phone = document.getElementById('reg-phone').value.trim();
-            const pass = document.getElementById('reg-pass').value.trim();
-
-            if (!name || !phone || !pass) {
-                showNotification('Registration Error', 'Please fill in all registration fields.', 'error');
-                return;
-            }
-
-            const existing = registeredUsers.find(u => u.phone === phone);
-            if (existing) {
-                showNotification('Phone Registered', 'An account with this phone number already exists. Please login.', 'error');
-                switchAuthTab('login');
-                return;
-            }
-
-            const newUser = { name, phone, pass, balance: 10000.00, isAdmin: false };
-            registeredUsers.push(newUser);
-            localStorage.setItem('aviator_users', JSON.stringify(registeredUsers));
-
-            loginSuccessful(newUser);
-        }
-
-        function submitLogin() {
-            const userInp = document.getElementById('login-user').value.trim();
-            const passInp = document.getElementById('login-pass').value.trim();
-
-            if (!userInp || !passInp) {
-                showNotification('Login Error', 'Please enter your username/phone and password.', 'error');
-                return;
-            }
-
-            // Check if Admin Login
-            if ((userInp === 'admin' || userInp === 'admin@aviator.com') && passInp === 'admin123') {
-                const adminUser = { name: 'Admin Principal', phone: '+254700000000', balance: 50000.00, isAdmin: true };
-                loginSuccessful(adminUser);
-                return;
-            }
-
-            const user = registeredUsers.find(u => (u.phone === userInp || u.name.toLowerCase() === userInp.toLowerCase()) && u.pass === passInp);
-            if (!user) {
-                showNotification('Login Failed', 'Invalid credentials. Please check your username or password.', 'error');
-                return;
-            }
-
-            loginSuccessful(user);
-        }
-
-        function loginSuccessful(user) {
-            currentUser = user;
-            userBalance = user.balance || 10000.00;
-            document.getElementById('header-user-tag').innerText = `${user.name} (${user.isAdmin ? 'Admin' : 'Player'})`;
-            document.getElementById('auth-modal').classList.add('hidden');
-            updateBalanceDisplay();
-
-            if (user.isAdmin) {
-                document.getElementById('admin-menu-btn').classList.remove('hidden');
-            } else {
-                document.getElementById('admin-menu-btn').classList.add('hidden');
-            }
-
-            showNotification('Welcome!', `Logged in successfully as ${user.name}`);
-        }
-
-        function logoutUser() {
-            currentUser = null;
-            document.getElementById('auth-modal').classList.remove('hidden');
-            switchAuthTab('login');
-            showNotification('Logged Out', 'You have been successfully logged out.');
-        }
-
-        function requestUssdReset() {
-            const phone = document.getElementById('forgot-phone').value.trim();
-            const user = registeredUsers.find(u => u.phone === phone);
-            
-            if (!user) {
-                showNotification('USSD Error', 'Phone number not found in registry.', 'error');
-                return;
-            }
-
-            document.getElementById('ussd-simulation-box').classList.remove('hidden');
-            document.getElementById('ussd-message-text').innerText = `USSD Code Sent to ${phone}:\nDial *483*88# to verify reset for ${user.name}. Enter new PIN below:`;
-            showNotification('USSD Sent', 'USSD reset prompt dispatched to your phone.');
-        }
-
-        function confirmUssdReset() {
-            const phone = document.getElementById('forgot-phone').value.trim();
-            const newPass = document.getElementById('ussd-input-pin').value.trim();
-            
-            if (!newPass) {
-                showNotification('Error', 'Please enter a new password.', 'error');
-                return;
-            }
-
-            const user = registeredUsers.find(u => u.phone === phone);
-            if (user) {
-                user.pass = newPass;
-                localStorage.setItem('aviator_users', JSON.stringify(registeredUsers));
-                showNotification('Success', 'Password reset via USSD confirmed! You can now login.');
-                switchAuthTab('login');
-            }
-        }
-
-        // --- AUDIO & SOUNDS ---
-        function initAudioContext() {
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (audioCtx.state === 'suspended') {
-                audioCtx.resume();
-            }
-        }
-
-        function playBeep(freq, type, duration) {
-            if (!soundEnabled) return;
-            try {
-                initAudioContext();
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.type = type;
-                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
-                osc.connect(gain);
-                gain.connect(audioCtx.destination);
-                osc.start();
-                osc.stop(audioCtx.currentTime + duration);
-            } catch(e) {}
-        }
-
-        function playCashoutSound() {
-            playBeep(587.33, 'sine', 0.1);
-            setTimeout(() => playBeep(880, 'sine', 0.2), 100);
-        }
-
-        function playCrashSound() {
-            playBeep(120, 'sawtooth', 0.5);
-        }
-
-        function toggleSound() {
-            soundEnabled = document.getElementById('sound-toggle').checked;
-        }
-
-        function toggleMusic() {
-            musicEnabled = document.getElementById('music-toggle').checked;
-        }
-
-        function toggleMenu() {
-            const menu = document.getElementById('dropdown-menu');
-            menu.classList.toggle('hidden');
-        }
-
-        // --- MODALS & BANKING ---
-        function openDepositModal() {
-            document.getElementById('deposit-modal').classList.remove('hidden');
-        }
-        function closeDepositModal() {
-            document.getElementById('deposit-modal').classList.add('hidden');
-        }
-        function setDepositAmount(amt) {
-            document.getElementById('deposit-amount-input').value = amt;
-        }
-        function submitDeposit() {
-            const amt = parseFloat(document.getElementById('deposit-amount-input').value) || 1000;
-            const promptLink = document.getElementById('deposit-prompt-link').value;
-            userBalance += amt;
-            updateBalanceDisplay();
-            closeDepositModal();
-            showNotification('Deposit Successful', `Added ${amt.toLocaleString()} KES via prompt link reference.`);
-        }
-
-        function openWithdrawModal() {
-            document.getElementById('withdraw-modal').classList.remove('hidden');
-        }
-        function closeWithdrawModal() {
-            document.getElementById('withdraw-modal').classList.add('hidden');
-        }
-        function submitWithdraw() {
-            const amt = parseFloat(document.getElementById('withdraw-amount-input').value) || 1000;
-            if (amt > userBalance) {
-                showNotification('Withdrawal Error', 'Insufficient balance for this withdrawal.', 'error');
-                return;
-            }
-            userBalance -= amt;
-            updateBalanceDisplay();
-            closeWithdrawModal();
-            showNotification('Withdrawal Requested', `Successfully initiated withdrawal of ${amt.toLocaleString()} KES.`);
-        }
-
-        function openProfileModal() {
-            document.getElementById('stat-wagered').innerText = stats.wagered.toFixed(2) + ' KES';
-            document.getElementById('stat-won').innerText = stats.won.toFixed(2) + ' KES';
-            document.getElementById('stat-rounds').innerText = stats.rounds;
-            document.getElementById('stat-highest').innerText = stats.highestMultiplier.toFixed(2) + 'x';
-            document.getElementById('profile-modal').classList.remove('hidden');
-            toggleMenu();
-        }
-        function closeProfileModal() {
-            document.getElementById('profile-modal').classList.add('hidden');
-        }
-
-        function openAdminModal() {
-            document.getElementById('admin-preview-1').innerText = nextMultipliers[0].toFixed(2) + 'x';
-            document.getElementById('admin-preview-2').innerText = nextMultipliers[1].toFixed(2) + 'x';
-            document.getElementById('admin-modal').classList.remove('hidden');
-            toggleMenu();
-        }
-        function closeAdminModal() {
-            document.getElementById('admin-modal').classList.add('hidden');
-        }
-        function applyAdminOverride() {
-            const val = parseFloat(document.getElementById('admin-override-val').value);
-            if (!isNaN(val) && val >= 1.0) {
-                nextMultipliers[0] = val;
-                document.getElementById('admin-preview-1').innerText = nextMultipliers[0].toFixed(2) + 'x';
-                showNotification('Admin Override Set', `Next round multiplier set to ${val.toFixed(2)}x`);
-            }
-        }
-
-        // --- MULTIPLAYER & LIVE PLAYERS FEED ---
-        function initLivePlayers() {
-            livePlayers = botNames.map(name => {
-                const betAmount = (Math.floor(Math.random() * 50) + 1) * 10;
-                return {
-                    name: name,
-                    bet: betAmount,
-                    cashedOut: false,
-                    cashoutAmount: 0
-                };
-            });
-            renderLivePlayers();
-        }
-
-        function renderLivePlayers() {
-            const container = document.getElementById('live-players-list');
-            let html = '';
-
-            // Render Player's Own Active / Recent Bets on Top
-            [1, 2].forEach(id => {
-                const bet = bets[id];
-                if (bet.active || bet.cashedOut) {
-                    html += `
-                        <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg bg-blue-950/40 border border-blue-800/50 items-center">
-                            <span class="text-blue-300 font-bold truncate">You (Bet ${id})</span>
-                            <span class="text-center font-mono text-gray-200">${bet.amount.toFixed(2)}</span>
-                            <span class="text-right font-bold ${bet.cashedOut ? 'text-emerald-400' : 'text-yellow-400'}">
-                                ${bet.cashedOut ? (bet.cashoutValue || 0).toFixed(2) + ' KES' : 'Running...'}
-                            </span>
-                        </div>
-                    `;
-                }
-            });
-
-            // Render Bot Players (Showing cashed out amount in KES instead of multiplier)
-            html += livePlayers.map(p => `
-                <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg hover:bg-cardBg/50 items-center border-b border-gray-800/30">
-                    <span class="text-gray-300 font-medium truncate">${p.name}</span>
-                    <span class="text-center font-mono text-gray-400">${p.bet.toFixed(2)}</span>
-                    <span class="text-right font-bold ${p.cashedOut ? 'text-emerald-400' : 'text-gray-500'}">
-                        ${p.cashedOut ? p.cashoutAmount.toFixed(2) + ' KES' : '...'}
-                    </span>
-                </div>
-            `).join('');
-
-            container.innerHTML = html;
-        }
-
-        function updateBalanceDisplay() {
-            document.getElementById('user-balance').innerText = userBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' KES';
-        }
-
-        function showNotification(title, text, type = 'success') {
-            const box = document.getElementById('notification-box');
-            const icon = document.getElementById('notification-icon');
-            document.getElementById('notification-title').innerText = title;
-            document.getElementById('notification-text').innerText = text;
-            
-            if(type === 'success') {
-                icon.innerHTML = '<i class="fa-solid fa-circle-check text-emerald-400"></i>';
-            } else {
-                icon.innerHTML = '<i class="fa-solid fa-circle-exclamation text-red-400"></i>';
-            }
-
-            box.classList.remove('translate-y-20', 'opacity-0');
-            setTimeout(() => {
-                box.classList.add('translate-y-20', 'opacity-0');
-            }, 3000);
-        }
-
-        function setTab(betId, mode) {
-            bets[betId].mode = mode;
-            const manualBtn = document.getElementById(`bet${betId}-tab-manual`);
-            const autoBtn = document.getElementById(`bet${betId}-tab-auto`);
-            if(mode === 'manual') {
-                manualBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
-                autoBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
-            } else {
-                autoBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
-                manualBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
-            }
-        }
-
-        function adjustBet(betId, delta) {
-            const input = document.getElementById(`bet${betId}-amount`);
-            let val = parseFloat(input.value) || 10;
-            val = Math.max(10, val + delta);
-            input.value = val.toFixed(2);
-        }
-
-        function setPresetBet(betId, amount) {
-            document.getElementById(`bet${betId}-amount`).value = amount.toFixed(2);
-        }
-
-        function handleBetClick(betId) {
-            initAudioContext();
-            const bet = bets[betId];
-            const amountInput = document.getElementById(`bet${betId}-amount`);
-            const actionBtn = document.getElementById(`bet${betId}-action-btn`);
-            const autoEnabledCheckbox = document.getElementById(`bet${betId}-auto-enabled`);
-            const autoMultInput = document.getElementById(`bet${betId}-auto-multiplier`);
-
-            bet.amount = parseFloat(amountInput.value) || 10;
-            bet.autoEnabled = autoEnabledCheckbox.checked;
-            bet.autoMultiplier = parseFloat(autoMultInput.value) || 2.00;
-
-            if (!bet.active) {
-                if (gameState === 'CRASHED') {
-                    showNotification('Round Ended', 'Please wait for the next round to place bets.', 'error');
-                    return;
-                }
-                if (userBalance < bet.amount) {
-                    showNotification('Insufficient Funds', 'Your balance is too low for this bet amount.', 'error');
-                    return;
-                }
-
-                userBalance -= bet.amount;
-                updateBalanceDisplay();
-                bet.active = true;
-                bet.cashedOut = false;
-                stats.wagered += bet.amount;
-
-                if (gameState === 'FLYING') {
-                    actionBtn.className = "w-full bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>CANCEL (NEXT)</span>`;
-                } else {
-                    actionBtn.className = "w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>CANCEL BET</span>`;
-                    amountInput.disabled = true;
-                }
-                showNotification('Bet Placed', `Successfully placed ${bet.amount.toFixed(2)} KES on Bet ${betId}.`);
-            } else {
-                if (gameState === 'WAITING') {
-                    userBalance += bet.amount;
-                    updateBalanceDisplay();
-                    bet.active = false;
-                    stats.wagered -= bet.amount;
-                    actionBtn.className = "w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>BET</span>`;
-                    amountInput.disabled = false;
-                    showNotification('Bet Cancelled', 'Your bet has been refunded.');
-                } else if (gameState === 'FLYING' && bet.active && !bet.cashedOut) {
-                    cashOutBet(betId);
-                }
-            }
-            renderLivePlayers();
-        }
-
-        function cashOutBet(betId) {
-            const bet = bets[betId];
-            if (!bet.active || bet.cashedOut) return;
-
-            bet.cashedOut = true;
-            const winnings = bet.amount * currentMultiplier;
-            bet.cashoutValue = winnings;
-            userBalance += winnings;
-            stats.won += winnings;
-            updateBalanceDisplay();
-            playCashoutSound();
-
-            const actionBtn = document.getElementById(`bet${betId}-action-btn`);
-            actionBtn.className = "w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-            actionBtn.innerHTML = `<span>WON ${winnings.toFixed(2)} KES</span>`;
-
-            showNotification('Cashed Out!', `You won ${winnings.toFixed(2)} KES at ${currentMultiplier.toFixed(2)}x!`);
-            renderLivePlayers();
-        }
-
-        function renderHistoryBar() {
-            const bar = document.getElementById('history-bar');
-            let html = '<span class="text-xs text-gray-500 font-semibold uppercase tracking-wider mr-1">History:</span>';
-            multiplierHistory.slice(-8).reverse().forEach(m => {
-                let colorClass = 'text-gray-300 bg-cardBg border-gray-700';
-                if(m >= 2.0 && m < 10.0) colorClass = 'text-blue-400 bg-blue-950/40 border-blue-800/50';
-                if(m >= 10.0) colorClass = 'text-yellow-400 bg-yellow-950/40 border-yellow-800/50';
-                html += `<span class="px-2.5 py-1 rounded-lg text-xs font-bold border ${colorClass}">${m.toFixed(2)}x</span>`;
-            });
-            bar.innerHTML = html;
-        }
-
-        // Canvas Setup & Rendering Loop
         const canvas = document.getElementById('flight-canvas');
         const ctx = canvas.getContext('2d');
 
@@ -5250,17 +5336,243 @@
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
+        function switchAuthTab(tab) {
+            document.getElementById('form-login').classList.add('hidden');
+            document.getElementById('form-register').classList.add('hidden');
+            document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
+            document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
+
+            if (tab === 'login') {
+                document.getElementById('form-login').classList.remove('hidden');
+                document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
+                document.getElementById('auth-title').innerText = "AVIATOR LOGIN";
+            } else {
+                document.getElementById('form-register').classList.remove('hidden');
+                document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
+                document.getElementById('auth-title').innerText = "CREATE ACCOUNT";
+            }
+        }
+
+        function submitRegister() {
+            const name = document.getElementById('reg-name').value.trim();
+            const phone = document.getElementById('reg-phone').value.trim();
+            const pass = document.getElementById('reg-pass').value.trim();
+            if (!name || !phone || !pass) {
+                showNotification('Error', 'Fill in all fields.', 'error');
+                return;
+            }
+            fetch('/api/register', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, phone, pass })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    currentUser = res.user;
+                    document.getElementById('auth-modal').classList.add('hidden');
+                    updateUserUI();
+                    showNotification('Success', 'Account created successfully!');
+                } else {
+                    showNotification('Error', res.message, 'error');
+                }
+            });
+        }
+
+        function submitLogin() {
+            const user = document.getElementById('login-user').value.trim();
+            const pass = document.getElementById('login-pass').value.trim();
+            if (!user || !pass) {
+                showNotification('Error', 'Fill in credentials.', 'error');
+                return;
+            }
+            fetch('/api/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ user, pass })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    currentUser = res.user;
+                    document.getElementById('auth-modal').classList.add('hidden');
+                    updateUserUI();
+                    showNotification('Success', `Logged in as ${currentUser.name}`);
+                } else {
+                    showNotification('Error', res.message, 'error');
+                }
+            });
+        }
+
+        function logoutUser() {
+            fetch('/api/logout', {method: 'POST'}).then(() => {
+                currentUser = null;
+                document.getElementById('auth-modal').classList.remove('hidden');
+                toggleMenu();
+            });
+        }
+
+        function updateUserUI() {
+            if (!currentUser) return;
+            document.getElementById('header-user-tag').innerText = `${currentUser.name} (${currentUser.isAdmin ? 'Admin' : 'Player'})`;
+            document.getElementById('user-balance').innerText = currentUser.balance.toLocaleString('en-US', {minimumFractionDigits: 2}) + ' KES';
+            if (currentUser.isAdmin) {
+                document.getElementById('admin-menu-btn').classList.remove('hidden');
+            } else {
+                document.getElementById('admin-menu-btn').classList.add('hidden');
+            }
+        }
+
+        function toggleMenu() {
+            document.getElementById('dropdown-menu').classList.toggle('hidden');
+        }
+
+        function openDepositModal() { document.getElementById('deposit-modal').classList.remove('hidden'); }
+        function closeDepositModal() { document.getElementById('deposit-modal').classList.add('hidden'); }
+        function submitDeposit() {
+            const amount = parseFloat(document.getElementById('deposit-amount-input').value) || 1000;
+            fetch('/api/deposit', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ amount })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    currentUser.balance = res.balance;
+                    updateUserUI();
+                    closeDepositModal();
+                    showNotification('Deposit Successful', `Credited ${amount} KES`);
+                }
+            });
+        }
+
+        function openWithdrawModal() { document.getElementById('withdraw-modal').classList.remove('hidden'); }
+        function closeWithdrawModal() { document.getElementById('withdraw-modal').classList.add('hidden'); }
+        function submitWithdraw() {
+            const amount = parseFloat(document.getElementById('withdraw-amount-input').value) || 1000;
+            fetch('/api/withdraw', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ amount })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    currentUser.balance = res.balance;
+                    updateUserUI();
+                    closeWithdrawModal();
+                    showNotification('Withdrawal Successful', `Withdrew ${amount} KES`);
+                } else {
+                    showNotification('Error', res.message, 'error');
+                }
+            });
+        }
+
+        function openProfileModal() {
+            document.getElementById('stat-username').innerText = currentUser ? currentUser.name : 'Guest';
+            document.getElementById('stat-balance').innerText = currentUser ? currentUser.balance.toFixed(2) + ' KES' : '0.00 KES';
+            document.getElementById('profile-modal').classList.remove('hidden');
+            toggleMenu();
+        }
+        function closeProfileModal() { document.getElementById('profile-modal').classList.add('hidden'); }
+
+        function openAdminModal() {
+            fetch('/api/state').then(r => r.json()).then(res => {
+                document.getElementById('admin-preview-1').innerText = (res.game.nextPreview || 2.0).toFixed(2) + 'x';
+                document.getElementById('admin-modal').classList.remove('hidden');
+                toggleMenu();
+            });
+        }
+        function closeAdminModal() { document.getElementById('admin-modal').classList.add('hidden'); }
+        function applyAdminOverride() {
+            const multiplier = parseFloat(document.getElementById('admin-override-val').value);
+            if (isNaN(multiplier)) return;
+            fetch('/api/admin/override', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ multiplier })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    document.getElementById('admin-preview-1').innerText = res.nextMultiplier.toFixed(2) + 'x';
+                    showNotification('Admin Override', `Next multiplier set to ${res.nextMultiplier}x`);
+                }
+            });
+        }
+
+        function showNotification(title, text, type = 'success') {
+            const box = document.getElementById('notification-box');
+            document.getElementById('notification-title').innerText = title;
+            document.getElementById('notification-text').innerText = text;
+            box.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => box.classList.add('translate-y-20', 'opacity-0'), 3000);
+        }
+
+        function setTab(betId, mode) {
+            const manualBtn = document.getElementById(`bet${betId}-tab-manual`);
+            const autoBtn = document.getElementById(`bet${betId}-tab-auto`);
+            if (mode === 'manual') {
+                manualBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
+                autoBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
+            } else {
+                autoBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
+                manualBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
+            }
+        }
+
+        function adjustBet(betId, delta) {
+            const input = document.getElementById(`bet${betId}-amount`);
+            let val = parseFloat(input.value) || 10;
+            input.value = Math.max(10, val + delta).toFixed(2);
+        }
+        function changeBetAmount(betId, delta) { adjustBet(betId, delta); }
+        function setPresetBet(betId, amount) { document.getElementById(`bet${betId}-amount`).value = amount.toFixed(2); }
+
+        function handleBetClick(betId) {
+            if (!currentUser) {
+                showNotification('Login Required', 'Please login to place bets.', 'error');
+                return;
+            }
+            const amount = parseFloat(document.getElementById(`bet${betId}-amount`).value) || 10;
+            const autoEnabled = document.getElementById(`bet${betId}-auto-enabled`).checked;
+            const autoMultiplier = parseFloat(document.getElementById(`bet${betId}-auto-multiplier`).value) || 2.0;
+
+            if (gameStateData.status === 'FLYING' && userBetsMap[betId].active) {
+                // Cash out action
+                fetch('/api/cashout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ betNumber: betId })
+                }).then(r => r.json()).then(res => {
+                    if (res.success) {
+                        currentUser.balance = res.balance;
+                        updateUserUI();
+                        showNotification('Cashed Out!', `Won ${res.winnings.toFixed(2)} KES at ${res.multiplier.toFixed(2)}x`);
+                    } else {
+                        showNotification('Error', res.message, 'error');
+                    }
+                });
+                return;
+            }
+
+            fetch('/api/bet', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ betNumber: betId, amount, autoEnabled, autoMultiplier })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    if (res.action === 'CANCELLED') {
+                        showNotification('Cancelled', 'Bet refunded.');
+                    } else {
+                        showNotification('Bet Placed', `Successfully placed ${amount} KES`);
+                    }
+                } else {
+                    showNotification('Error', res.message, 'error');
+                }
+            });
+        }
+
         function drawFlightCurve(progress) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            if (gameState === 'WAITING') return;
+            if (gameStateData.status !== 'FLYING') return;
 
             const width = canvas.width;
             const height = canvas.height;
 
             ctx.beginPath();
             ctx.moveTo(0, height);
-
             const curveX = width * 0.8 * Math.min(progress, 1);
             const curveY = height - (height * 0.7 * Math.pow(progress, 2));
 
@@ -5281,184 +5593,134 @@
             ctx.lineWidth = 3;
             ctx.stroke();
 
-            const planeIndicator = document.getElementById('airplane-indicator');
-            planeIndicator.style.left = `${Math.min(curveX, width - 40)}px`;
-            planeIndicator.style.top = `${Math.max(curveY - 20, 20)}px`;
-            planeIndicator.classList.remove('hidden');
+            const plane = document.getElementById('airplane-indicator');
+            plane.style.left = `${Math.min(curveX, width - 40)}px`;
+            plane.style.top = `${Math.max(curveY - 20, 20)}px`;
+            plane.classList.remove('hidden');
         }
 
-        function startWaitingPhase() {
-            gameState = 'WAITING';
-            currentMultiplier = 1.00;
-            stats.rounds++;
-            document.getElementById('multiplier-display').innerText = '1.00x';
-            document.getElementById('multiplier-display').className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight';
-            
-            const statusText = document.getElementById('flight-status-text');
-            statusText.innerText = 'WAITING FOR NEXT ROUND';
-            statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-emerald-400 bg-emerald-950/60 px-4 py-1.5 rounded-full border border-emerald-800/50 shadow';
-
-            document.getElementById('airplane-indicator').classList.add('hidden');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            [1, 2].forEach(id => {
-                document.getElementById(`bet${id}-live-win`).classList.add('hidden');
-                const bet = bets[id];
-                const actionBtn = document.getElementById(`bet${id}-action-btn`);
-                const amountInput = document.getElementById(`bet${id}-amount`);
-                
-                if (bet.active && !bet.cashedOut) {
-                    actionBtn.className = "w-full bg-yellow-500 hover:bg-yellow-400 text-gray-950 font-black py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>CASH OUT</span>`;
-                    document.getElementById(`bet${id}-live-win`).classList.remove('hidden');
-                } else if (!bet.active) {
-                    actionBtn.className = "w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>BET</span>`;
-                    amountInput.disabled = false;
-                }
+        function updateHistoryBar(history) {
+            const bar = document.getElementById('history-bar');
+            let html = '<span class="text-xs text-gray-500 font-semibold uppercase tracking-wider mr-1">History:</span>';
+            (history || []).slice(-8).reverse().forEach(m => {
+                let colorClass = 'text-gray-300 bg-cardBg border-gray-700';
+                if (m >= 2.0 && m < 10.0) colorClass = 'text-blue-400 bg-blue-950/40 border-blue-800/50';
+                if (m >= 10.0) colorClass = 'text-yellow-400 bg-yellow-950/40 border-yellow-800/50';
+                html += `<span class="px-2.5 py-1 rounded-lg text-xs font-bold border ${colorClass}">${m.toFixed(2)}x</span>`;
             });
-
-            initLivePlayers();
-
-            let countdown = 3;
-            statusText.innerText = `NEXT ROUND IN ${countdown}s`;
-            
-            const timer = setInterval(() => {
-                countdown--;
-                if(countdown > 0) {
-                    statusText.innerText = `NEXT ROUND IN ${countdown}s`;
-                } else {
-                    clearInterval(timer);
-                    startFlightPhase();
-                }
-            }, 1000);
+            bar.innerHTML = html;
         }
 
-        function startFlightPhase() {
-            gameState = 'FLYING';
-            flightStartTime = Date.now();
-            
-            // Pop next crash multiplier from queue and replenish queue
-            crashMultiplier = nextMultipliers.shift();
-            const upcomingRand = parseFloat((1.01 + (Math.random() * Math.random() * 20)).toFixed(2));
-            nextMultipliers.push(upcomingRand);
-
-            if (crashMultiplier > stats.highestMultiplier) {
-                stats.highestMultiplier = crashMultiplier;
-            }
-
-            flightDuration = (crashMultiplier - 1) * 1500 + 2000;
-            if(flightDuration < 1500) flightDuration = 1500;
-
-            const statusText = document.getElementById('flight-status-text');
-            statusText.innerText = 'FLIGHT IS FLYING';
-            statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-blue-400 bg-blue-950/60 px-4 py-1.5 rounded-full border border-blue-800/50 shadow';
-
-            [1, 2].forEach(id => {
-                const bet = bets[id];
-                const actionBtn = document.getElementById(`bet${id}-action-btn`);
-                if (bet.active) {
-                    actionBtn.className = "w-full bg-yellow-500 hover:bg-yellow-400 text-gray-950 font-black py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                    actionBtn.innerHTML = `<span>CASH OUT</span>`;
-                    document.getElementById(`bet${id}-live-win`).classList.remove('hidden');
+        function pollGameState() {
+            fetch('/api/state').then(r => r.json()).then(res => {
+                if (!res.success) return;
+                if (res.user && res.user.name && !currentUser) {
+                    currentUser = res.user;
+                    updateUserUI();
+                    document.getElementById('auth-modal').classList.add('hidden');
                 }
-            });
-
-            requestAnimationFrame(flightTick);
-        }
-
-        function flightTick() {
-            if (gameState !== 'FLYING') return;
-
-            const elapsed = Date.now() - flightStartTime;
-            const progress = Math.min(elapsed / flightDuration, 1);
-
-            if (progress >= 1 || currentMultiplier >= crashMultiplier) {
-                currentMultiplier = crashMultiplier;
-                triggerCrash();
-                return;
-            }
-
-            currentMultiplier = 1.00 + (crashMultiplier - 1.00) * Math.pow(progress, 1.8);
-            if (currentMultiplier > crashMultiplier) currentMultiplier = crashMultiplier;
-
-            document.getElementById('multiplier-display').innerText = currentMultiplier.toFixed(2) + 'x';
-            
-            [1, 2].forEach(id => {
-                const bet = bets[id];
-                if (bet.active && !bet.cashedOut) {
-                    const potentialWin = bet.amount * currentMultiplier;
-                    document.getElementById(`bet${id}-win-amount`).innerText = potentialWin.toFixed(2);
-                    document.getElementById(`bet${id}-live-mult`).innerText = currentMultiplier.toFixed(2) + 'x';
+                if (currentUser && res.user) {
+                    currentUser.balance = res.user.balance;
+                    updateUserUI();
                 }
-            });
 
-            drawFlightCurve(progress);
+                gameStateData = res.game;
+                updateHistoryBar(gameStateData.history);
 
-            [1, 2].forEach(id => {
-                const bet = bets[id];
-                if (bet.active && !bet.cashedOut && bet.autoEnabled && currentMultiplier >= bet.autoMultiplier) {
-                    cashOutBet(id);
+                const multDisplay = document.getElementById('multiplier-display');
+                const statusText = document.getElementById('flight-status-text');
+                const plane = document.getElementById('airplane-indicator');
+
+                multDisplay.innerText = gameStateData.currentMultiplier.toFixed(2) + 'x';
+
+                if (gameStateData.status === 'WAITING') {
+                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight';
+                    statusText.innerText = 'WAITING FOR NEXT ROUND';
+                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-emerald-400 bg-emerald-950/60 px-4 py-1.5 rounded-full border border-emerald-800/50 shadow';
+                    plane.classList.add('hidden');
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                } else if (gameStateData.status === 'FLYING') {
+                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight';
+                    statusText.innerText = 'FLIGHT IS FLYING';
+                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-blue-400 bg-blue-950/60 px-4 py-1.5 rounded-full border border-blue-800/50 shadow';
+                    let progress = Math.min((gameStateData.currentMultiplier - 1) / 5, 1);
+                    drawFlightCurve(progress);
+                } else if (gameStateData.status === 'CRASHED') {
+                    multDisplay.innerText = (gameStateData.crashPoint || gameStateData.currentMultiplier).toFixed(2) + 'x';
+                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-red-500 tracking-tight';
+                    statusText.innerText = 'FLED / CRASHED';
+                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-red-400 bg-red-950/60 px-4 py-1.5 rounded-full border border-red-800/50 shadow';
+                    plane.classList.add('hidden');
                 }
-            });
 
-            livePlayers.forEach(p => {
-                if (!p.cashedOut && Math.random() < 0.03 && currentMultiplier > 1.2) {
-                    if (currentMultiplier < (p.bet > 300 ? 2.5 : 8.0)) {
-                        p.cashedOut = true;
-                        p.cashoutAmount = p.bet * currentMultiplier;
+                // Update user bets state UI
+                [1, 2].forEach(id => {
+                    const ub = (res.userBets || []).find(b => b.betNumber === id);
+                    const btn = document.getElementById(`bet${id}-action-btn`);
+                    const liveWinBox = document.getElementById(`bet${id}-live-win`);
+                    userBetsMap[id] = ub || { active: false, cashedOut: false };
+
+                    if (ub && ub.active) {
+                        if (gameStateData.status === 'FLYING') {
+                            btn.className = "w-full bg-yellow-500 hover:bg-yellow-400 text-gray-950 font-black py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
+                            btn.innerHTML = `<span>CASH OUT</span>`;
+                            liveWinBox.classList.remove('hidden');
+                            document.getElementById(`bet${id}-win-amount`).innerText = (ub.amount * gameStateData.currentMultiplier).toFixed(2);
+                            document.getElementById(`bet${id}-live-mult`).innerText = gameStateData.currentMultiplier.toFixed(2) + 'x';
+                        } else {
+                            btn.className = "w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
+                            btn.innerHTML = `<span>CANCEL BET</span>`;
+                            liveWinBox.classList.add('hidden');
+                        }
+                    } else {
+                        btn.className = "w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
+                        btn.innerHTML = `<span>BET</span>`;
+                        liveWinBox.classList.add('hidden');
                     }
-                }
-            });
-            renderLivePlayers();
+                });
 
-            requestAnimationFrame(flightTick);
+                // Render live players sidebar
+                const list = document.getElementById('live-players-list');
+                let html = '';
+                [1, 2].forEach(id => {
+                    const ub = (res.userBets || []).find(b => b.betNumber === id);
+                    if (ub) {
+                        html += `
+                            <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg bg-blue-950/40 border border-blue-800/50 items-center">
+                                <span class="text-blue-300 font-bold truncate">You (Bet ${id})</span>
+                                <span class="text-center font-mono text-gray-200">${ub.amount.toFixed(2)}</span>
+                                <span class="text-right font-bold ${ub.cashedOut ? 'text-emerald-400' : 'text-yellow-400'}">
+                                    ${ub.cashedOut ? ub.cashoutValue.toFixed(2) + ' KES' : 'Running...'}
+                                </span>
+                            </div>
+                        `;
+                    }
+                });
+                (gameStateData.botBets || []).forEach(b => {
+                    html += `
+                        <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg hover:bg-cardBg/50 items-center border-b border-gray-800/30">
+                            <span class="text-gray-300 font-medium truncate">${b.username}</span>
+                            <span class="text-center font-mono text-gray-400">${b.amount.toFixed(2)}</span>
+                            <span class="text-right font-bold ${b.cashedOut ? 'text-emerald-400' : 'text-gray-500'}">
+                                ${b.cashedOut ? b.cashoutAmount.toFixed(2) + ' KES' : '...'}
+                            </span>
+                        </div>
+                    `;
+                });
+                list.innerHTML = html;
+            });
         }
 
-        function triggerCrash() {
-            gameState = 'CRASHED';
-            playCrashSound();
-            document.getElementById('multiplier-display').innerText = crashMultiplier.toFixed(2) + 'x';
-            document.getElementById('multiplier-display').className = 'text-5xl sm:text-7xl font-black flight-glow text-red-500 tracking-tight';
-
-            const statusText = document.getElementById('flight-status-text');
-            statusText.innerText = 'FLED / CRASHED';
-            statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-red-400 bg-red-950/60 px-4 py-1.5 rounded-full border border-red-800/50 shadow';
-
-            document.getElementById('airplane-indicator').classList.add('hidden');
-
-            [1, 2].forEach(id => {
-                const bet = bets[id];
-                const actionBtn = document.getElementById(`bet${id}-action-btn`);
-                const amountInput = document.getElementById(`bet${id}-amount`);
-                document.getElementById(`bet${id}-live-win`).classList.add('hidden');
-
-                if (bet.active && !bet.cashedOut) {
-                    bet.cashedOut = true;
-                    actionBtn.className = "w-full bg-gray-700 text-gray-400 font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase cursor-not-allowed";
-                    actionBtn.innerHTML = `<span>LOST</span>`;
-                }
-                
-                bet.active = false;
-                bet.cashedOut = false;
-                amountInput.disabled = false;
-            });
-
-            multiplierHistory.push(crashMultiplier);
-            renderHistoryBar();
-            renderLivePlayers();
-
-            setTimeout(() => {
-                startWaitingPhase();
-            }, 4000);
-        }
-
-        window.onload = function() {
-            updateBalanceDisplay();
-            renderHistoryBar();
-            initLivePlayers();
-            startWaitingPhase();
-        };
+        setInterval(pollGameState, 150);
     </script>
 </body>
 </html>
+"""
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+
+
+
+
+
