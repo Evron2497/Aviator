@@ -1727,7 +1727,7 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 
         <!-- ADMIN ONLY PANEL -->
         <div id="adminPanel" class="admin-banner" style="display:none;">
-            <span>👑 ADMIN PANEL: Next Round Preview</span>
+            <span>ADMIN PANEL: Next Round Preview</span>
             <span class="admin-val" id="lblNextCrash">--</span>
         </div>
 
@@ -1761,11 +1761,11 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 
         <!-- Wallet Deposit & Withdrawal -->
         <div class="wallet-panel">
-            <h4 style="margin-top:0; color:#eab308;">Bank & M-Pesa Wallet</h4>
+            <h4 style="margin-top:0; color:#eab308;">M-Pesa Wallet</h4>
             <label>Transaction Amount (KSh)</label>
             <input type="number" id="walletAmount" placeholder="Enter amount" min="1">
             <div class="wallet-row">
-                <button onclick="openDepositLink()" style="background:#2563eb;">Deposit via Prompt Link</button>
+                <button onclick="openDepositLink()" style="background:#2563eb;">Deposit</button>
                 <button onclick="withdrawFunds()" style="background:#dc2626;">Withdraw Funds</button>
             </div>
         </div>
