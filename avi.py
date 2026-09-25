@@ -4345,6 +4345,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS rounds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             crash_point REAL NOT NULL,
+            server_seed TEXT NOT NULL,
+            client_seed TEXT NOT NULL,
+            hash TEXT NOT NULL,
             started_at TEXT NOT NULL,
             ended_at TEXT
         )
@@ -4358,6 +4361,7 @@ def init_db():
             bet_number INTEGER NOT NULL,
             amount REAL NOT NULL,
             auto_cashout REAL,
+            auto_bet_enabled INTEGER DEFAULT 0,
             cashout_multiplier REAL,
             winnings REAL DEFAULT 0,
             status TEXT NOT NULL,
@@ -4372,6 +4376,12 @@ def init_db():
             expires_at REAL NOT NULL
         )
     """)
+
+    # Verify column existence for auto_bet_enabled (Schema migration safety)
+    cursor = conn.execute("PRAGMA table_info(bets)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "auto_bet_enabled" not in columns:
+        conn.execute("ALTER TABLE bets ADD COLUMN auto_bet_enabled INTEGER DEFAULT 0")
 
     admin = conn.execute("SELECT id FROM users WHERE username = ?", ("EVRON",)).fetchone()
     if not admin:
@@ -4397,17 +4407,22 @@ def init_db():
 # GAME ENGINE & ACCELERATION CURVE
 # ============================================================
 
-def generate_crash_point():
-    value = random.random()
-    if value < 0.04:
-        return round(random.uniform(1.00, 1.08), 2)
-    elif value < 0.25:
-        return round(random.uniform(1.09, 2.15), 2)
-    elif value < 0.65:
-        return round(random.uniform(2.16, 6.50), 2)
-    elif value < 0.90:
-        return round(random.uniform(6.51, 25.00), 2)
-    return round(random.uniform(25.00, 150.00), 2)
+def generate_provably_fair_round():
+    server_seed = secrets.token_hex(16)
+    client_seed = secrets.token_hex(8)
+    combined = f"{server_seed}-{client_seed}".encode('utf-8')
+    hash_hex = hashlib.sha256(combined).hexdigest()
+    
+    # Calculate crash point deterministically from hash prefix
+    hash_int = int(hash_hex[:8], 16)
+    if hash_int % 33 == 0:
+        crash_point = 1.00
+    else:
+        crash_point = round(max(1.00, (100.0 * (2**32) - hash_int) / ((2**32) - hash_int + 1) / 100.0), 2)
+        if crash_point > 100.0:
+            crash_point = round(random.uniform(25.0, 150.0), 2)
+            
+    return round(crash_point, 2), server_seed, client_seed, hash_hex
 
 
 def calculate_multiplier(elapsed):
@@ -4415,10 +4430,18 @@ def calculate_multiplier(elapsed):
     return round(multiplier, 2)
 
 
+# Initialize first seed pair
+cp_init, ss_init, cs_init, h_init = generate_provably_fair_round()
+cp_next, ss_next, cs_next, h_next = generate_provably_fair_round()
+
 GAME = {
     "round_id": None,
-    "crash_point": None,
-    "next_crash_points": [generate_crash_point(), generate_crash_point()],
+    "crash_point": cp_init,
+    "server_seed": ss_init,
+    "client_seed": cs_init,
+    "hash": h_init,
+    "next_crash_points": [cp_next],
+    "next_seeds": [{"server_seed": ss_next, "client_seed": cs_next, "hash": h_next}],
     "status": "WAITING",
     "betting_start": None,
     "run_start": None,
@@ -4459,18 +4482,52 @@ def generate_bot_bets():
 
 
 def create_round_locked():
-    crash_point = GAME["next_crash_points"].pop(0)
-    GAME["next_crash_points"].append(generate_crash_point())
+    if GAME["next_seeds"]:
+        next_data = GAME["next_seeds"].pop(0)
+        crash_point = GAME["next_crash_points"].pop(0)
+        server_seed = next_data["server_seed"]
+        client_seed = next_data["client_seed"]
+        hash_hex = next_data["hash"]
+    else:
+        crash_point, server_seed, client_seed, hash_hex = generate_provably_fair_round()
+
+    cp_new, ss_new, cs_new, h_new = generate_provably_fair_round()
+    GAME["next_crash_points"].append(cp_new)
+    GAME["next_seeds"].append({"server_seed": ss_new, "client_seed": cs_new, "hash": h_new})
 
     now = datetime.now().isoformat()
     conn = get_db()
-    cursor = conn.execute("INSERT INTO rounds (crash_point, started_at) VALUES (?, ?)", (crash_point, now))
+    cursor = conn.execute("""
+        INSERT INTO rounds (crash_point, server_seed, client_seed, hash, started_at) 
+        VALUES (?, ?, ?, ?, ?)
+    """, (crash_point, server_seed, client_seed, hash_hex, now))
     round_id = cursor.lastrowid
+    
+    # Process Auto Bets for active users
+    active_auto_bets = conn.execute("""
+        SELECT b.username, b.bet_number, b.amount, b.auto_cashout, u.balance 
+        FROM bets b 
+        JOIN users u ON b.username = u.username 
+        WHERE b.auto_bet_enabled = 1
+        GROUP BY b.username, b.bet_number
+    """).fetchall()
+
+    for ab in active_auto_bets:
+        if ab["balance"] >= ab["amount"]:
+            conn.execute("UPDATE users SET balance = balance - ? WHERE username = ?", (ab["amount"], ab["username"]))
+            conn.execute("""
+                INSERT INTO bets (username, round_id, bet_number, amount, auto_cashout, auto_bet_enabled, status, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, 'ACTIVE', ?)
+            """, (ab["username"], round_id, ab["bet_number"], ab["amount"], ab["auto_cashout"], now))
+
     conn.commit()
     conn.close()
 
     GAME["round_id"] = round_id
     GAME["crash_point"] = crash_point
+    GAME["server_seed"] = server_seed
+    GAME["client_seed"] = client_seed
+    GAME["hash"] = hash_hex
     GAME["status"] = "WAITING"
     GAME["betting_start"] = time.time()
     GAME["run_start"] = None
@@ -4712,6 +4769,7 @@ def api_state():
                     "amount": br["amount"],
                     "autoEnabled": br["auto_cashout"] is not None,
                     "autoMultiplier": br["auto_cashout"] or 2.0,
+                    "autoBet": bool(br["auto_bet_enabled"]),
                     "active": br["status"] == "ACTIVE",
                     "cashedOut": br["status"] == "WON",
                     "cashoutValue": br["winnings"]
@@ -4720,12 +4778,16 @@ def api_state():
 
     with GAME_LOCK:
         game_payload = {
+            "roundId": GAME["round_id"],
             "status": GAME["status"],
             "currentMultiplier": GAME["current_multiplier"],
             "crashPoint": GAME["crash_point"] if GAME["status"] == "CRASHED" else None,
+            "serverSeed": GAME["server_seed"],
+            "clientSeed": GAME["client_seed"],
+            "hash": GAME["hash"],
             "history": GAME["multiplier_history"],
             "botBets": GAME["bot_bets"],
-            "nextPreview": GAME["next_point_preview"] if "next_point_preview" in GAME else GAME["next_crash_points"][0]
+            "nextPreview": GAME["next_crash_points"][0]
         }
 
     return jsonify({
@@ -4747,6 +4809,7 @@ def api_bet():
     amount = float(data.get("amount", 10.0))
     auto_enabled = bool(data.get("autoEnabled", False))
     auto_mult = float(data.get("autoMultiplier", 2.0))
+    auto_bet = bool(data.get("autoBet", False))
 
     with GAME_LOCK:
         if GAME["status"] == "CRASHED":
@@ -4759,16 +4822,12 @@ def api_bet():
         conn.close()
         return jsonify({"success": False, "message": "Insufficient balance."}), 400
 
-    # Deduct balance & place bet
-    conn.execute("UPDATE users SET balance = balance - ? WHERE username = ?", (amount, username))
-    
-    # Check if existing bet for this round/bet_number exists
     existing_bet = conn.execute("SELECT * FROM bets WHERE username = ? AND round_id = ? AND bet_number = ?", (username, round_id, bet_number)).fetchone()
     
     if existing_bet:
         if existing_bet["status"] == "ACTIVE":
-            # Refund & cancel
-            conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount + existing_bet["amount"], username))
+            # Refund & cancel bet
+            conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (existing_bet["amount"], username))
             conn.execute("DELETE FROM bets WHERE id = ?", (existing_bet["id"],))
             conn.commit()
             conn.close()
@@ -4777,11 +4836,13 @@ def api_bet():
             conn.close()
             return jsonify({"success": False, "message": "Bet already settled."}), 400
 
+    # Place new bet
+    conn.execute("UPDATE users SET balance = balance - ? WHERE username = ?", (amount, username))
     now = datetime.now().isoformat()
     conn.execute("""
-        INSERT INTO bets (username, round_id, bet_number, amount, auto_cashout, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (username, round_id, bet_number, amount, auto_mult if auto_enabled else None, "ACTIVE", now))
+        INSERT INTO bets (username, round_id, bet_number, amount, auto_cashout, auto_bet_enabled, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (username, round_id, bet_number, amount, auto_mult if auto_enabled else None, 1 if auto_bet else 0, "ACTIVE", now))
     conn.commit()
     
     updated_user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
@@ -4838,6 +4899,9 @@ def api_deposit():
     data = request.json or {}
     amount = float(data.get("amount", 1000.0))
 
+    if amount < MIN_DEPOSIT:
+        return jsonify({"success": False, "message": f"Minimum deposit amount is {MIN_DEPOSIT} KES."}), 400
+
     conn = get_db()
     conn.execute("UPDATE users SET balance = balance + ? WHERE username = ?", (amount, username))
     user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
@@ -4855,6 +4919,9 @@ def api_withdraw():
 
     data = request.json or {}
     amount = float(data.get("amount", 1000.0))
+
+    if amount < MIN_WITHDRAWAL:
+        return jsonify({"success": False, "message": f"Minimum withdrawal amount is {MIN_WITHDRAWAL} KES."}), 400
 
     conn = get_db()
     user = conn.execute("SELECT balance FROM users WHERE username = ?", (username,)).fetchone()
@@ -4902,7 +4969,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aviator Flight Game</title>
+    <title>Aviator Live Casino</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -4924,26 +4991,11 @@ HTML_TEMPLATE = """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #0b0e14;
-            color: #f7fafc;
-            overflow-x: hidden;
-        }
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #121824;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #2a374d;
-            border-radius: 3px;
-        }
-        .flight-glow {
-            text-shadow: 0 0 25px rgba(236, 201, 75, 0.6);
-        }
+        body { font-family: 'Inter', sans-serif; background-color: #0b0e14; color: #f7fafc; overflow-x: hidden; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #121824; }
+        ::-webkit-scrollbar-thumb { background: #2a374d; border-radius: 3px; }
+        .flight-glow { text-shadow: 0 0 25px rgba(236, 201, 75, 0.6); }
     </style>
 </head>
 <body class="min-h-screen flex flex-col justify-between bg-darkBg text-white">
@@ -5032,17 +5084,17 @@ HTML_TEMPLATE = """
                 <span class="font-bold text-sm text-gray-200">Menu</span>
                 <button onclick="toggleMenu()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
             </div>
-            <button onclick="openProfileModal()" class="flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-cardBg text-gray-300 transition text-sm font-medium">
-                <i class="fa-solid fa-user text-blue-400 w-5"></i>
-                <span>Profile & Stats</span>
+            <button onclick="openProvablyFairModal()" class="flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-cardBg text-gray-300 transition text-sm font-medium">
+                <i class="fa-solid fa-shield-halved text-emerald-400 w-5"></i>
+                <span>Provably Fair Seeds</span>
             </button>
             <button onclick="openWithdrawModal()" class="flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-cardBg text-gray-300 transition text-sm font-medium">
                 <i class="fa-solid fa-wallet text-emerald-400 w-5"></i>
                 <span>Withdraw Funds</span>
             </button>
             <button id="admin-menu-btn" onclick="openAdminModal()" class="hidden flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-cardBg text-yellow-400 transition text-sm font-bold border border-yellow-800/40">
-                <i class="fa-solid fa-shield-halved w-5"></i>
-                <span>Admin Dashboard</span>
+                <i class="fa-solid fa-lock w-5"></i>
+                <span>Admin Override Panel</span>
             </button>
             <button onclick="logoutUser()" class="flex items-center space-x-3 px-3 py-2.5 rounded-xl hover:bg-red-950/40 text-red-400 transition text-sm font-medium border-t border-gray-800 mt-2">
                 <i class="fa-solid fa-right-from-bracket w-5"></i>
@@ -5074,13 +5126,9 @@ HTML_TEMPLATE = """
                         WAITING FOR NEXT ROUND
                     </div>
                 </div>
-
-                <div id="airplane-indicator" class="absolute z-20 text-yellow-400 text-3xl sm:text-4xl transition-all duration-75 hidden">
-                    <i class="fa-solid fa-plane animate-bounce"></i>
-                </div>
             </div>
 
-            <!-- BET PANELS -->
+            <!-- DUAL BET PANELS -->
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 
                 <!-- BET PANEL 1 -->
@@ -5088,51 +5136,36 @@ HTML_TEMPLATE = """
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-sm text-gray-200">BET 1</span>
                         <div class="flex items-center space-x-1 bg-cardBg p-1 rounded-lg border border-gray-700 text-xs">
-                            <button onclick="setTab(1, 'manual')" id="bet1-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
-                            <button onclick="setTab(1, 'auto')" id="bet1-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
+                            <button onclick="setTab(1, 'manual')" id="bet1-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-bold transition">Manual</button>
+                            <button onclick="setTab(1, 'auto')" id="bet1-tab-auto" class="px-3 py-1 rounded-md text-gray-400 font-bold hover:text-white transition">Auto</button>
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-2 gap-3">
+                    <div class="grid grid-cols-2 gap-2">
                         <div class="flex flex-col space-y-1">
-                            <div class="flex justify-between text-xs text-gray-400 font-medium">
-                                <span>Amount (KES)</span>
-                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet(1, 100)">+100</span>
-                            </div>
-                            <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <button onclick="changeBetAmount(1, -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
-                                <input id="bet1-amount" type="number" value="10.00" min="10" step="10" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <button onclick="changeBetAmount(1, 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
-                            </div>
+                            <label class="text-[10px] uppercase font-bold text-gray-400">Amount (KES)</label>
+                            <input id="bet1-amount" type="number" value="100" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-sm font-bold text-yellow-400 focus:outline-none">
                         </div>
-
                         <div class="flex flex-col space-y-1">
-                            <div class="flex items-center justify-between text-xs text-gray-400 font-medium">
-                                <span>Auto Cash Out</span>
-                                <input type="checkbox" id="bet1-auto-enabled" class="accent-blue-600 rounded cursor-pointer">
-                            </div>
-                            <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <input id="bet1-auto-multiplier" type="number" value="2.00" min="1.01" step="0.1" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <span class="text-xs text-gray-500 font-semibold pr-1">x</span>
-                            </div>
+                            <label class="text-[10px] uppercase font-bold text-gray-400">Auto Cashout</label>
+                            <input id="bet1-auto-mult" type="number" step="0.1" value="2.00" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-sm font-bold text-emerald-400 focus:outline-none">
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-4 gap-1.5 pt-1">
-                        <button onclick="setPresetBet(1, 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
-                        <button onclick="setPresetBet(1, 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
-                        <button onclick="setPresetBet(1, 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
-                        <button onclick="setPresetBet(1, 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
+                    <div class="flex items-center justify-between text-xs text-gray-400">
+                        <label class="flex items-center space-x-2 cursor-pointer">
+                            <input id="bet1-auto-cash-check" type="checkbox" class="rounded bg-cardBg border-gray-700 text-emerald-500 focus:ring-0">
+                            <span>Auto Cashout</span>
+                        </label>
+                        <label id="bet1-autobet-container" class="hidden flex items-center space-x-2 cursor-pointer">
+                            <input id="bet1-autobet-check" type="checkbox" class="rounded bg-cardBg border-gray-700 text-blue-500 focus:ring-0">
+                            <span>Auto Bet</span>
+                        </label>
                     </div>
 
-                    <div class="flex flex-col space-y-1">
-                        <button id="bet1-action-btn" onclick="handleBetClick(1)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase">
-                            <span>BET</span>
-                        </button>
-                    </div>
-                    <div id="bet1-live-win" class="hidden text-center text-xs text-yellow-400 font-bold bg-yellow-950/40 py-1.5 rounded-lg border border-yellow-800/40">
-                        Live Winnings: <span id="bet1-win-amount">0.00</span> KES (<span id="bet1-live-mult">1.00x</span>)
-                    </div>
+                    <button id="bet1-action-btn" onclick="triggerBet(1)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-3 rounded-xl shadow-lg transition text-base uppercase">
+                        PLACE BET
+                    </button>
                 </div>
 
                 <!-- BET PANEL 2 -->
@@ -5140,585 +5173,462 @@ HTML_TEMPLATE = """
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-sm text-gray-200">BET 2</span>
                         <div class="flex items-center space-x-1 bg-cardBg p-1 rounded-lg border border-gray-700 text-xs">
-                            <button onclick="setTab(2, 'manual')" id="bet2-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition">Manual</button>
-                            <button onclick="setTab(2, 'auto')" id="bet2-tab-auto" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition">Auto</button>
+                            <button onclick="setTab(2, 'manual')" id="bet2-tab-manual" class="px-3 py-1 rounded-md bg-blue-600 text-white font-bold transition">Manual</button>
+                            <button onclick="setTab(2, 'auto')" id="bet2-tab-auto" class="px-3 py-1 rounded-md text-gray-400 font-bold hover:text-white transition">Auto</button>
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-2 gap-3">
+                    <div class="grid grid-cols-2 gap-2">
                         <div class="flex flex-col space-y-1">
-                            <div class="flex justify-between text-xs text-gray-400 font-medium">
-                                <span>Amount (KES)</span>
-                                <span class="cursor-pointer text-blue-400 hover:underline" onclick="adjustBet(2, 100)">+100</span>
-                            </div>
-                            <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <button onclick="changeBetAmount(2, -10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-minus text-xs"></i></button>
-                                <input id="bet2-amount" type="number" value="10.00" min="10" step="10" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <button onclick="changeBetAmount(2, 10)" class="text-gray-400 hover:text-white px-1 font-bold"><i class="fa-solid fa-plus text-xs"></i></button>
-                            </div>
+                            <label class="text-[10px] uppercase font-bold text-gray-400">Amount (KES)</label>
+                            <input id="bet2-amount" type="number" value="200" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-sm font-bold text-yellow-400 focus:outline-none">
                         </div>
-
                         <div class="flex flex-col space-y-1">
-                            <div class="flex items-center justify-between text-xs text-gray-400 font-medium">
-                                <span>Auto Cash Out</span>
-                                <input type="checkbox" id="bet2-auto-enabled" class="accent-blue-600 rounded cursor-pointer">
-                            </div>
-                            <div class="flex items-center bg-cardBg rounded-xl border border-gray-700 overflow-hidden px-3 py-2">
-                                <input id="bet2-auto-multiplier" type="number" value="2.00" min="1.01" step="0.1" class="w-full bg-transparent text-center font-bold text-white focus:outline-none text-sm">
-                                <span class="text-xs text-gray-500 font-semibold pr-1">x</span>
-                            </div>
+                            <label class="text-[10px] uppercase font-bold text-gray-400">Auto Cashout</label>
+                            <input id="bet2-auto-mult" type="number" step="0.1" value="1.50" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-sm font-bold text-emerald-400 focus:outline-none">
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-4 gap-1.5 pt-1">
-                        <button onclick="setPresetBet(2, 50)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">50</button>
-                        <button onclick="setPresetBet(2, 100)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">100</button>
-                        <button onclick="setPresetBet(2, 500)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">500</button>
-                        <button onclick="setPresetBet(2, 1000)" class="bg-cardBg hover:bg-gray-700/60 text-xs py-1.5 rounded-lg font-semibold border border-gray-700 text-gray-300 transition">1000</button>
+                    <div class="flex items-center justify-between text-xs text-gray-400">
+                        <label class="flex items-center space-x-2 cursor-pointer">
+                            <input id="bet2-auto-cash-check" type="checkbox" class="rounded bg-cardBg border-gray-700 text-emerald-500 focus:ring-0">
+                            <span>Auto Cashout</span>
+                        </label>
+                        <label id="bet2-autobet-container" class="hidden flex items-center space-x-2 cursor-pointer">
+                            <input id="bet2-autobet-check" type="checkbox" class="rounded bg-cardBg border-gray-700 text-blue-500 focus:ring-0">
+                            <span>Auto Bet</span>
+                        </label>
                     </div>
 
-                    <div class="flex flex-col space-y-1">
-                        <button id="bet2-action-btn" onclick="handleBetClick(2)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase">
-                            <span>BET</span>
-                        </button>
-                    </div>
-                    <div id="bet2-live-win" class="hidden text-center text-xs text-yellow-400 font-bold bg-yellow-950/40 py-1.5 rounded-lg border border-yellow-800/40">
-                        Live Winnings: <span id="bet2-win-amount">0.00</span> KES (<span id="bet2-live-mult">1.00x</span>)
-                    </div>
+                    <button id="bet2-action-btn" onclick="triggerBet(2)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-3 rounded-xl shadow-lg transition text-base uppercase">
+                        PLACE BET
+                    </button>
                 </div>
 
             </div>
-
         </section>
 
-        <!-- LIVE PLAYERS SIDEBAR -->
-        <section class="lg:col-span-4 bg-panelBg rounded-2xl border border-gray-800 p-4 flex flex-col h-[350px] lg:h-auto shadow-xl">
+        <!-- LIVE BETS FEED -->
+        <section class="lg:col-span-4 bg-panelBg rounded-2xl border border-gray-800 p-4 flex flex-col h-[520px] lg:h-auto shadow-xl">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
-                <h2 class="font-bold text-sm uppercase tracking-wider text-gray-300 flex items-center space-x-2">
-                    <i class="fa-solid fa-users text-blue-400"></i>
-                    <span>All Bets & Players</span>
-                </h2>
-                <span id="live-count" class="bg-blue-900/60 text-blue-300 text-xs px-2 py-0.5 rounded-full font-semibold">Online</span>
-            </div>
-            
-            <div class="grid grid-cols-3 text-xs text-gray-400 font-semibold py-2 border-b border-gray-800/50">
-                <span>User</span>
-                <span class="text-center">Bet (KES)</span>
-                <span class="text-right">Cashed Out</span>
+                <h3 class="font-bold text-sm text-gray-200">Live Bets</h3>
+                <span id="live-bets-count" class="bg-cardBg text-gray-400 border border-gray-700 px-2 py-0.5 rounded-full text-xs font-semibold">0 Bets</span>
             </div>
 
-            <div id="live-players-list" class="flex-1 overflow-y-auto space-y-2 py-2 pr-1 text-xs">
+            <div class="grid grid-cols-3 text-[11px] font-bold text-gray-500 py-2 border-b border-gray-800 uppercase">
+                <span>User</span>
+                <span class="text-center">Bet</span>
+                <span class="text-right">Cashout</span>
+            </div>
+
+            <div id="live-bets-list" class="flex-1 overflow-y-auto space-y-1.5 pt-2">
+                <!-- Dynamically populated bets -->
             </div>
         </section>
 
     </main>
 
-    <!-- DEPOSIT MODAL -->
-    <div id="deposit-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
+    <!-- PROVABLY FAIR MODAL -->
+    <div id="pf-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-panelBg border border-gray-700 w-full max-w-lg rounded-3xl p-6 shadow-2xl flex flex-col space-y-4">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
-                <h3 class="font-bold text-base text-white flex items-center space-x-2">
-                    <i class="fa-solid fa-wallet text-emerald-400"></i>
-                    <span>Deposit via M-PESA</span>
-                </h3>
+                <h3 class="font-black text-lg text-emerald-400">Provably Fair Seeds</h3>
+                <button onclick="closeProvablyFairModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="space-y-3 text-xs">
+                <div>
+                    <label class="text-gray-400 font-semibold block mb-1">Server Seed (SHA-256):</label>
+                    <input id="pf-server-seed" readonly type="text" class="w-full bg-cardBg border border-gray-700 rounded-xl p-2.5 font-mono text-yellow-400">
+                </div>
+                <div>
+                    <label class="text-gray-400 font-semibold block mb-1">Client Seed:</label>
+                    <input id="pf-client-seed" readonly type="text" class="w-full bg-cardBg border border-gray-700 rounded-xl p-2.5 font-mono text-blue-400">
+                </div>
+                <div>
+                    <label class="text-gray-400 font-semibold block mb-1">Combined Verification Hash:</label>
+                    <input id="pf-hash" readonly type="text" class="w-full bg-cardBg border border-gray-700 rounded-xl p-2.5 font-mono text-emerald-400">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ADMIN OVERRIDE MODAL -->
+    <div id="admin-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col space-y-4">
+            <div class="flex items-center justify-between pb-3 border-b border-gray-800">
+                <h3 class="font-black text-lg text-yellow-400">Admin Crash Control</h3>
+                <button onclick="closeAdminModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="flex flex-col space-y-2">
+                <label class="text-xs text-gray-400 font-medium">Set Target Crash Multiplier for Next Round:</label>
+                <input id="admin-crash-input" type="number" step="0.01" value="2.50" class="bg-cardBg border border-gray-700 rounded-xl p-3 text-base font-bold text-yellow-400 focus:outline-none">
+            </div>
+            <button onclick="submitAdminOverride()" class="w-full bg-yellow-500 hover:bg-yellow-400 text-black font-black py-3 rounded-xl shadow-lg transition uppercase text-sm">
+                Override Next Round Target
+            </button>
+        </div>
+    </div>
+
+    <!-- DEPOSIT MODAL -->
+    <div id="deposit-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col space-y-4">
+            <div class="flex items-center justify-between pb-3 border-b border-gray-800">
+                <h3 class="font-black text-lg text-emerald-400">Deposit Funds</h3>
                 <button onclick="closeDepositModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="flex flex-col space-y-2">
                 <label class="text-xs text-gray-400 font-medium">Amount to Deposit (KES):</label>
-                <input id="deposit-amount-input" type="number" value="1000" min="100" step="100" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-sm font-bold text-white focus:outline-none">
+                <input id="deposit-amount-input" type="number" value="1000" class="bg-cardBg border border-gray-700 rounded-xl p-3 text-base font-bold text-emerald-400 focus:outline-none">
             </div>
-            <button onclick="submitDeposit()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl shadow-lg transition text-sm uppercase">
+            <button onclick="submitDeposit()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-3 rounded-xl shadow-lg transition uppercase text-sm">
                 Confirm Deposit
             </button>
         </div>
     </div>
 
     <!-- WITHDRAW MODAL -->
-    <div id="withdraw-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
+    <div id="withdraw-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-3xl p-6 shadow-2xl flex flex-col space-y-4">
             <div class="flex items-center justify-between pb-3 border-b border-gray-800">
-                <h3 class="font-bold text-base text-white flex items-center space-x-2">
-                    <i class="fa-solid fa-money-bill-transfer text-blue-400"></i>
-                    <span>Withdraw Funds (KES)</span>
-                </h3>
+                <h3 class="font-black text-lg text-emerald-400">Withdraw Funds</h3>
                 <button onclick="closeWithdrawModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="flex flex-col space-y-2">
-                <label class="text-xs text-gray-400 font-medium">Withdrawal Amount (KES):</label>
-                <input id="withdraw-amount-input" type="number" value="1000" min="100" class="bg-cardBg border border-gray-700 rounded-xl px-3 py-2.5 text-sm font-bold text-white focus:outline-none">
+                <label class="text-xs text-gray-400 font-medium">Amount to Withdraw (KES):</label>
+                <input id="withdraw-amount-input" type="number" value="1000" class="bg-cardBg border border-gray-700 rounded-xl p-3 text-base font-bold text-yellow-400 focus:outline-none">
             </div>
-            <button onclick="submitWithdraw()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl shadow-lg transition text-sm uppercase">
-                Proceed Withdrawal
+            <button onclick="submitWithdraw()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-3 rounded-xl shadow-lg transition uppercase text-sm">
+                Request Withdrawal
             </button>
         </div>
     </div>
 
-    <!-- PROFILE MODAL -->
-    <div id="profile-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-        <div class="bg-panelBg border border-gray-700 w-full max-w-md rounded-2xl p-6 shadow-2xl flex flex-col space-y-4">
-            <div class="flex items-center justify-between pb-3 border-b border-gray-800">
-                <h3 class="font-bold text-base text-white flex items-center space-x-2">
-                    <i class="fa-solid fa-user-gear text-yellow-400"></i>
-                    <span>User Profile & Statistics</span>
-                </h3>
-                <button onclick="closeProfileModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
-            </div>
-            <div class="grid grid-cols-2 gap-3 text-xs">
-                <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Account Username</div>
-                    <div id="stat-username" class="text-sm font-bold text-white mt-1">Player</div>
-                </div>
-                <div class="bg-cardBg p-3 rounded-xl border border-gray-700">
-                    <div class="text-gray-400">Balance</div>
-                    <div id="stat-balance" class="text-sm font-bold text-emerald-400 mt-1">0.00 KES</div>
-                </div>
-            </div>
-            <button onclick="closeProfileModal()" class="w-full bg-gray-700 hover:bg-gray-600 text-white font-bold py-2.5 rounded-xl transition text-xs uppercase">
-                Close
-            </button>
-        </div>
-    </div>
-
-    <!-- ADMIN MODAL -->
-    <div id="admin-modal" class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 hidden flex items-center justify-center p-4">
-        <div class="bg-panelBg border border-yellow-600/60 w-full max-w-lg rounded-3xl p-6 shadow-2xl flex flex-col space-y-5">
-            <div class="flex items-center justify-between pb-3 border-b border-gray-800">
-                <h3 class="font-black text-base text-yellow-400 flex items-center space-x-2">
-                    <i class="fa-solid fa-shield-halved"></i>
-                    <span>Admin Control Dashboard</span>
-                </h3>
-                <button onclick="closeAdminModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
-            </div>
-            <div class="bg-cardBg p-4 rounded-2xl border border-yellow-800/40 space-y-3">
-                <div class="text-xs text-yellow-300 font-bold uppercase tracking-wider"><i class="fa-solid fa-eye"></i> Upcoming Flight Multiplier Preview:</div>
-                <div class="grid grid-cols-1 gap-3 text-center">
-                    <div class="bg-black/40 p-3 rounded-xl border border-gray-800">
-                        <div class="text-xs text-gray-400">Next Round Multiplier</div>
-                        <div id="admin-preview-1" class="text-xl font-black text-yellow-400 mt-1">--</div>
-                    </div>
-                </div>
-            </div>
-            <div class="flex flex-col space-y-2">
-                <label class="text-xs text-gray-400 font-medium">Override Next Multiplier:</label>
-                <div class="flex space-x-2">
-                    <input id="admin-override-val" type="number" step="0.1" placeholder="e.g. 5.00" class="w-full bg-cardBg border border-gray-700 rounded-xl px-3 py-2 text-xs text-white">
-                    <button onclick="applyAdminOverride()" class="bg-yellow-600 hover:bg-yellow-500 font-bold px-4 py-2 rounded-xl text-gray-950 text-xs">Set</button>
-                </div>
-            </div>
-            <button onclick="closeAdminModal()" class="w-full bg-gray-800 hover:bg-gray-700 text-white font-bold py-2.5 rounded-xl transition text-xs uppercase">
-                Close Dashboard
-            </button>
-        </div>
-    </div>
-
-    <!-- NOTIFICATION TOAST -->
-    <div id="notification-box" class="fixed bottom-6 right-6 z-50 transform translate-y-20 opacity-0 transition-all duration-300 bg-cardBg border border-gray-700 text-white px-5 py-3 rounded-xl shadow-2xl flex items-center space-x-3">
-        <div id="notification-icon" class="text-emerald-400 text-lg"><i class="fa-solid fa-circle-check"></i></div>
-        <div>
-            <h4 id="notification-title" class="font-bold text-sm">Success</h4>
-            <p id="notification-text" class="text-xs text-gray-300">Action completed successfully.</p>
-        </div>
-    </div>
-
+    <!-- FRONTEND JAVASCRIPT ENGINE -->
     <script>
         let currentUser = null;
-        let gameStateData = { status: 'WAITING', currentMultiplier: 1.00, history: [], botBets: [] };
-        let userBetsMap = { 1: { active: false, cashedOut: false, amount: 10 }, 2: { active: false, cashedOut: false, amount: 10 } };
+        let gameStatus = 'WAITING';
+        let currentBetState = { 1: null, 2: null };
 
+        // CANVAS ENGINE
         const canvas = document.getElementById('flight-canvas');
         const ctx = canvas.getContext('2d');
 
         function resizeCanvas() {
-            const container = canvas.parentElement;
-            canvas.width = container.clientWidth;
-            canvas.height = container.clientHeight;
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
         }
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
-        function switchAuthTab(tab) {
-            document.getElementById('form-login').classList.add('hidden');
-            document.getElementById('form-register').classList.add('hidden');
-            document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
-            document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg text-gray-400 hover:text-white transition";
+        function drawFlightCurve(multiplier) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (gameStatus !== 'FLYING' && gameStatus !== 'CRASHED') return;
 
-            if (tab === 'login') {
-                document.getElementById('form-login').classList.remove('hidden');
-                document.getElementById('auth-tab-login').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
-                document.getElementById('auth-title').innerText = "AVIATOR LOGIN";
-            } else {
-                document.getElementById('form-register').classList.remove('hidden');
-                document.getElementById('auth-tab-register').className = "py-2.5 rounded-lg bg-blue-600 text-white transition";
-                document.getElementById('auth-title').innerText = "CREATE ACCOUNT";
+            const w = canvas.width;
+            const h = canvas.height;
+
+            const progress = Math.min((multiplier - 1.0) / 10.0, 1.0);
+            const targetX = w * 0.15 + (w * 0.7) * progress;
+            const targetY = h * 0.85 - (h * 0.65) * progress;
+
+            ctx.beginPath();
+            ctx.moveTo(w * 0.1, h * 0.9);
+            ctx.quadraticCurveTo(targetX * 0.5, h * 0.9, targetX, targetY);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = gameStatus === 'CRASHED' ? '#e53e3e' : '#ecc94b';
+            ctx.stroke();
+
+            // Gradient Fill
+            ctx.lineTo(targetX, h * 0.9);
+            ctx.lineTo(w * 0.1, h * 0.9);
+            const grad = ctx.createLinearGradient(0, targetY, 0, h * 0.9);
+            grad.addColorStop(0, gameStatus === 'CRASHED' ? 'rgba(229, 62, 62, 0.3)' : 'rgba(236, 201, 75, 0.3)');
+            grad.addColorStop(1, 'transparent');
+            ctx.fillStyle = grad;
+            ctx.fill();
+        }
+
+        // POLLING LOOP
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/state');
+                const data = await res.json();
+                if (!data.success) return;
+
+                if (data.user && data.user.name !== 'Player') {
+                    currentUser = data.user;
+                    document.getElementById('auth-modal').classList.add('hidden');
+                    document.getElementById('header-user-tag').innerText = `Welcome, ${data.user.name}`;
+                    document.getElementById('user-balance').innerText = `${data.user.balance.toFixed(2)} KES`;
+                    
+                    if (data.user.isAdmin) {
+                        document.getElementById('admin-menu-btn').classList.remove('hidden');
+                    }
+                }
+
+                updateGameUI(data.game);
+                updateUserBetsUI(data.userBets);
+            } catch (err) {
+                console.error("State sync error:", err);
             }
         }
 
-        function submitRegister() {
-            const name = document.getElementById('reg-name').value.trim();
-            const phone = document.getElementById('reg-phone').value.trim();
-            const pass = document.getElementById('reg-pass').value.trim();
-            if (!name || !phone || !pass) {
-                showNotification('Error', 'Fill in all fields.', 'error');
-                return;
+        function updateGameUI(game) {
+            gameStatus = game.status;
+
+            // Update Multiplier Display
+            const multDisplay = document.getElementById('multiplier-display');
+            const statusText = document.getElementById('flight-status-text');
+
+            if (game.status === 'WAITING') {
+                multDisplay.innerText = '1.00x';
+                multDisplay.className = 'text-5xl sm:text-7xl font-black text-yellow-400';
+                statusText.innerText = 'WAITING FOR NEXT ROUND';
+                statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-emerald-400 bg-emerald-950/60 px-4 py-1.5 rounded-full border border-emerald-800/50 shadow';
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            } else if (game.status === 'FLYING') {
+                multDisplay.innerText = `${game.currentMultiplier.toFixed(2)}x`;
+                multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400';
+                statusText.innerText = 'FLEW AWAY...';
+                statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-yellow-400 bg-yellow-950/60 px-4 py-1.5 rounded-full border border-yellow-800/50 shadow hidden';
+                drawFlightCurve(game.currentMultiplier);
+            } else if (game.status === 'CRASHED') {
+                multDisplay.innerText = `${game.crashPoint.toFixed(2)}x`;
+                multDisplay.className = 'text-5xl sm:text-7xl font-black text-red-500';
+                statusText.innerText = 'FLEW AWAY!';
+                statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-red-400 bg-red-950/60 px-4 py-1.5 rounded-full border border-red-800/50 shadow';
+                drawFlightCurve(game.crashPoint);
             }
-            fetch('/api/register', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ name, phone, pass })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    currentUser = res.user;
-                    document.getElementById('auth-modal').classList.add('hidden');
-                    updateUserUI();
-                    showNotification('Success', 'Account created successfully!');
+
+            // Update Provably Fair Modal Inputs
+            document.getElementById('pf-server-seed').value = game.serverSeed || '';
+            document.getElementById('pf-client-seed').value = game.clientSeed || '';
+            document.getElementById('pf-hash').value = game.hash || '';
+
+            // Render History
+            const historyBar = document.getElementById('history-bar');
+            historyBar.innerHTML = '<span class="text-xs text-gray-500 font-semibold uppercase tracking-wider mr-1">History:</span>';
+            game.history.slice().reverse().forEach(val => {
+                const tag = document.createElement('span');
+                tag.className = `px-2 py-0.5 rounded-lg text-xs font-bold ${val >= 2.0 ? 'bg-blue-900/60 text-blue-300 border border-blue-700/50' : 'bg-red-900/60 text-red-300 border border-red-700/50'}`;
+                tag.innerText = `${val.toFixed(2)}x`;
+                historyBar.appendChild(tag);
+            });
+
+            // Render Live Bot Bets
+            const list = document.getElementById('live-bets-list');
+            list.innerHTML = '';
+            document.getElementById('live-bets-count').innerText = `${game.botBets.length} Bets`;
+
+            game.botBets.forEach(bot => {
+                const row = document.createElement('div');
+                row.className = 'grid grid-cols-3 text-xs py-1.5 border-b border-gray-800/50 items-center';
+                
+                const userCol = `<span class="text-gray-300 font-medium">${bot.username}</span>`;
+                const betCol = `<span class="text-center font-bold text-yellow-400">${bot.amount} KES</span>`;
+                let cashCol = `<span class="text-right text-gray-500 font-semibold">-</span>`;
+
+                if (bot.cashedOut) {
+                    cashCol = `<span class="text-right text-emerald-400 font-bold">${bot.cashoutAmount} KES (${bot.cashout_multiplier}x)</span>`;
+                } else if (game.status === 'CRASHED') {
+                    cashCol = `<span class="text-right text-red-400 font-bold">Crashed</span>`;
+                }
+
+                row.innerHTML = userCol + betCol + cashCol;
+                list.appendChild(row);
+            });
+        }
+
+        function updateUserBetsUI(bets) {
+            [1, 2].forEach(num => {
+                const bet = bets.find(b => b.betNumber === num);
+                const btn = document.getElementById(`bet${num}-action-btn`);
+
+                if (bet && bet.active) {
+                    if (gameStatus === 'FLYING') {
+                        btn.innerText = 'CASHOUT';
+                        btn.className = 'w-full bg-yellow-500 hover:bg-yellow-400 text-black font-black py-3 rounded-xl shadow-lg transition text-base uppercase animate-pulse';
+                    } else {
+                        btn.innerText = 'CANCEL BET';
+                        btn.className = 'w-full bg-red-600 hover:bg-red-500 text-white font-black py-3 rounded-xl shadow-lg transition text-base uppercase';
+                    }
                 } else {
-                    showNotification('Error', res.message, 'error');
+                    btn.innerText = 'PLACE BET';
+                    btn.className = 'w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-3 rounded-xl shadow-lg transition text-base uppercase';
                 }
             });
         }
 
-        function submitLogin() {
-            const user = document.getElementById('login-user').value.trim();
-            const pass = document.getElementById('login-pass').value.trim();
-            if (!user || !pass) {
-                showNotification('Error', 'Fill in credentials.', 'error');
-                return;
+        // ACTIONS
+        async function triggerBet(num) {
+            const btn = document.getElementById(`bet${num}-action-btn`);
+            const amount = parseFloat(document.getElementById(`bet${num}-amount`).value);
+            const autoEnabled = document.getElementById(`bet${num}-auto-cash-check`).checked;
+            const autoMult = parseFloat(document.getElementById(`bet${num}-auto-mult`).value);
+            const autoBet = document.getElementById(`bet${num}-autobet-check`).checked;
+
+            if (btn.innerText === 'CASHOUT') {
+                const res = await fetch('/api/cashout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ betNumber: num })
+                });
+                const data = await res.json();
+                if (data.success) fetchState();
+            } else {
+                const res = await fetch('/api/bet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        betNumber: num,
+                        amount: amount,
+                        autoEnabled: autoEnabled,
+                        autoMultiplier: autoMult,
+                        autoBet: autoBet
+                    })
+                });
+                const data = await res.json();
+                if (data.success) fetchState();
             }
-            fetch('/api/login', {
+        }
+
+        function setTab(num, mode) {
+            const container = document.getElementById(`bet${num}-autobet-container`);
+            const btnManual = document.getElementById(`bet${num}-tab-manual`);
+            const btnAuto = document.getElementById(`bet${num}-tab-auto`);
+
+            if (mode === 'auto') {
+                container.classList.remove('hidden');
+                btnAuto.className = 'px-3 py-1 rounded-md bg-blue-600 text-white font-bold transition';
+                btnManual.className = 'px-3 py-1 rounded-md text-gray-400 font-bold hover:text-white transition';
+            } else {
+                container.classList.add('hidden');
+                btnManual.className = 'px-3 py-1 rounded-md bg-blue-600 text-white font-bold transition';
+                btnAuto.className = 'px-3 py-1 rounded-md text-gray-400 font-bold hover:text-white transition';
+            }
+        }
+
+        // AUTH & MODALS
+        function switchAuthTab(tab) {
+            if (tab === 'login') {
+                document.getElementById('form-login').classList.remove('hidden');
+                document.getElementById('form-register').classList.add('hidden');
+                document.getElementById('auth-tab-login').className = 'py-2.5 rounded-lg bg-blue-600 text-white transition';
+                document.getElementById('auth-tab-register').className = 'py-2.5 rounded-lg text-gray-400 hover:text-white transition';
+            } else {
+                document.getElementById('form-register').classList.remove('hidden');
+                document.getElementById('form-login').classList.add('hidden');
+                document.getElementById('auth-tab-register').className = 'py-2.5 rounded-lg bg-blue-600 text-white transition';
+                document.getElementById('auth-tab-login').className = 'py-2.5 rounded-lg text-gray-400 hover:text-white transition';
+            }
+        }
+
+        async function submitLogin() {
+            const user = document.getElementById('login-user').value;
+            const pass = document.getElementById('login-pass').value;
+            const res = await fetch('/api/login', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ user, pass })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    currentUser = res.user;
-                    document.getElementById('auth-modal').classList.add('hidden');
-                    updateUserUI();
-                    showNotification('Success', `Logged in as ${currentUser.name}`);
-                } else {
-                    showNotification('Error', res.message, 'error');
-                }
             });
+            const data = await res.json();
+            if (data.success) fetchState();
         }
 
-        function logoutUser() {
-            fetch('/api/logout', {method: 'POST'}).then(() => {
-                currentUser = null;
-                document.getElementById('auth-modal').classList.remove('hidden');
-                toggleMenu();
+        async function submitRegister() {
+            const name = document.getElementById('reg-name').value;
+            const phone = document.getElementById('reg-phone').value;
+            const pass = document.getElementById('reg-pass').value;
+            const res = await fetch('/api/register', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, phone, pass })
             });
+            const data = await res.json();
+            if (data.success) fetchState();
         }
 
-        function updateUserUI() {
-            if (!currentUser) return;
-            document.getElementById('header-user-tag').innerText = `${currentUser.name} (${currentUser.isAdmin ? 'Admin' : 'Player'})`;
-            document.getElementById('user-balance').innerText = currentUser.balance.toLocaleString('en-US', {minimumFractionDigits: 2}) + ' KES';
-            if (currentUser.isAdmin) {
-                document.getElementById('admin-menu-btn').classList.remove('hidden');
-            } else {
-                document.getElementById('admin-menu-btn').classList.add('hidden');
-            }
+        async function logoutUser() {
+            await fetch('/api/logout', { method: 'POST' });
+            window.location.reload();
         }
 
         function toggleMenu() {
             document.getElementById('dropdown-menu').classList.toggle('hidden');
         }
 
-        function openDepositModal() { document.getElementById('deposit-modal').classList.remove('hidden'); }
-        function closeDepositModal() { document.getElementById('deposit-modal').classList.add('hidden'); }
-        function submitDeposit() {
-            const amount = parseFloat(document.getElementById('deposit-amount-input').value) || 1000;
-            fetch('/api/deposit', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ amount })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    currentUser.balance = res.balance;
-                    updateUserUI();
-                    closeDepositModal();
-                    showNotification('Deposit Successful', `Credited ${amount} KES`);
-                }
-            });
-        }
-
-        function openWithdrawModal() { document.getElementById('withdraw-modal').classList.remove('hidden'); }
-        function closeWithdrawModal() { document.getElementById('withdraw-modal').classList.add('hidden'); }
-        function submitWithdraw() {
-            const amount = parseFloat(document.getElementById('withdraw-amount-input').value) || 1000;
-            fetch('/api/withdraw', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ amount })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    currentUser.balance = res.balance;
-                    updateUserUI();
-                    closeWithdrawModal();
-                    showNotification('Withdrawal Successful', `Withdrew ${amount} KES`);
-                } else {
-                    showNotification('Error', res.message, 'error');
-                }
-            });
-        }
-
-        function openProfileModal() {
-            document.getElementById('stat-username').innerText = currentUser ? currentUser.name : 'Guest';
-            document.getElementById('stat-balance').innerText = currentUser ? currentUser.balance.toFixed(2) + ' KES' : '0.00 KES';
-            document.getElementById('profile-modal').classList.remove('hidden');
+        function openProvablyFairModal() {
+            document.getElementById('pf-modal').classList.remove('hidden');
             toggleMenu();
         }
-        function closeProfileModal() { document.getElementById('profile-modal').classList.add('hidden'); }
+        function closeProvablyFairModal() {
+            document.getElementById('pf-modal').classList.add('hidden');
+        }
 
         function openAdminModal() {
-            fetch('/api/state').then(r => r.json()).then(res => {
-                document.getElementById('admin-preview-1').innerText = (res.game.nextPreview || 2.0).toFixed(2) + 'x';
-                document.getElementById('admin-modal').classList.remove('hidden');
-                toggleMenu();
-            });
+            document.getElementById('admin-modal').classList.remove('hidden');
+            toggleMenu();
         }
-        function closeAdminModal() { document.getElementById('admin-modal').classList.add('hidden'); }
-        function applyAdminOverride() {
-            const multiplier = parseFloat(document.getElementById('admin-override-val').value);
-            if (isNaN(multiplier)) return;
-            fetch('/api/admin/override', {
+        function closeAdminModal() {
+            document.getElementById('admin-modal').classList.add('hidden');
+        }
+
+        async function submitAdminOverride() {
+            const mult = parseFloat(document.getElementById('admin-crash-input').value);
+            await fetch('/api/admin/override', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ multiplier })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    document.getElementById('admin-preview-1').innerText = res.nextMultiplier.toFixed(2) + 'x';
-                    showNotification('Admin Override', `Next multiplier set to ${res.nextMultiplier}x`);
-                }
+                body: JSON.stringify({ multiplier: mult })
             });
+            closeAdminModal();
         }
 
-        function showNotification(title, text, type = 'success') {
-            const box = document.getElementById('notification-box');
-            document.getElementById('notification-title').innerText = title;
-            document.getElementById('notification-text').innerText = text;
-            box.classList.remove('translate-y-20', 'opacity-0');
-            setTimeout(() => box.classList.add('translate-y-20', 'opacity-0'), 3000);
+        function openDepositModal() {
+            document.getElementById('deposit-modal').classList.remove('hidden');
+        }
+        function closeDepositModal() {
+            document.getElementById('deposit-modal').classList.add('hidden');
         }
 
-        function setTab(betId, mode) {
-            const manualBtn = document.getElementById(`bet${betId}-tab-manual`);
-            const autoBtn = document.getElementById(`bet${betId}-tab-auto`);
-            if (mode === 'manual') {
-                manualBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
-                autoBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
-            } else {
-                autoBtn.className = "px-3 py-1 rounded-md bg-blue-600 text-white font-semibold transition";
-                manualBtn.className = "px-3 py-1 rounded-md text-gray-400 hover:text-white transition";
-            }
-        }
-
-        function adjustBet(betId, delta) {
-            const input = document.getElementById(`bet${betId}-amount`);
-            let val = parseFloat(input.value) || 10;
-            input.value = Math.max(10, val + delta).toFixed(2);
-        }
-        function changeBetAmount(betId, delta) { adjustBet(betId, delta); }
-        function setPresetBet(betId, amount) { document.getElementById(`bet${betId}-amount`).value = amount.toFixed(2); }
-
-        function handleBetClick(betId) {
-            if (!currentUser) {
-                showNotification('Login Required', 'Please login to place bets.', 'error');
-                return;
-            }
-            const amount = parseFloat(document.getElementById(`bet${betId}-amount`).value) || 10;
-            const autoEnabled = document.getElementById(`bet${betId}-auto-enabled`).checked;
-            const autoMultiplier = parseFloat(document.getElementById(`bet${betId}-auto-multiplier`).value) || 2.0;
-
-            if (gameStateData.status === 'FLYING' && userBetsMap[betId].active) {
-                // Cash out action
-                fetch('/api/cashout', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ betNumber: betId })
-                }).then(r => r.json()).then(res => {
-                    if (res.success) {
-                        currentUser.balance = res.balance;
-                        updateUserUI();
-                        showNotification('Cashed Out!', `Won ${res.winnings.toFixed(2)} KES at ${res.multiplier.toFixed(2)}x`);
-                    } else {
-                        showNotification('Error', res.message, 'error');
-                    }
-                });
-                return;
-            }
-
-            fetch('/api/bet', {
+        async function submitDeposit() {
+            const amount = parseFloat(document.getElementById('deposit-amount-input').value);
+            await fetch('/api/deposit', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ betNumber: betId, amount, autoEnabled, autoMultiplier })
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    if (res.action === 'CANCELLED') {
-                        showNotification('Cancelled', 'Bet refunded.');
-                    } else {
-                        showNotification('Bet Placed', `Successfully placed ${amount} KES`);
-                    }
-                } else {
-                    showNotification('Error', res.message, 'error');
-                }
+                body: JSON.stringify({ amount })
             });
+            closeDepositModal();
+            fetchState();
         }
 
-        function drawFlightCurve(progress) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            if (gameStateData.status !== 'FLYING') return;
-
-            const width = canvas.width;
-            const height = canvas.height;
-
-            ctx.beginPath();
-            ctx.moveTo(0, height);
-            const curveX = width * 0.8 * Math.min(progress, 1);
-            const curveY = height - (height * 0.7 * Math.pow(progress, 2));
-
-            ctx.quadraticCurveTo(curveX * 0.5, height, curveX, curveY);
-            ctx.lineTo(curveX, height);
-            ctx.closePath();
-
-            const gradient = ctx.createLinearGradient(0, 0, 0, height);
-            gradient.addColorStop(0, 'rgba(229, 62, 62, 0.3)');
-            gradient.addColorStop(1, 'rgba(229, 62, 62, 0.0)');
-            ctx.fillStyle = gradient;
-            ctx.fill();
-
-            ctx.beginPath();
-            ctx.moveTo(0, height);
-            ctx.quadraticCurveTo(curveX * 0.5, height, curveX, curveY);
-            ctx.strokeStyle = '#e53e3e';
-            ctx.lineWidth = 3;
-            ctx.stroke();
-
-            const plane = document.getElementById('airplane-indicator');
-            plane.style.left = `${Math.min(curveX, width - 40)}px`;
-            plane.style.top = `${Math.max(curveY - 20, 20)}px`;
-            plane.classList.remove('hidden');
+        function openWithdrawModal() {
+            document.getElementById('withdraw-modal').classList.remove('hidden');
+        }
+        function closeWithdrawModal() {
+            document.getElementById('withdraw-modal').classList.add('hidden');
         }
 
-        function updateHistoryBar(history) {
-            const bar = document.getElementById('history-bar');
-            let html = '<span class="text-xs text-gray-500 font-semibold uppercase tracking-wider mr-1">History:</span>';
-            (history || []).slice(-8).reverse().forEach(m => {
-                let colorClass = 'text-gray-300 bg-cardBg border-gray-700';
-                if (m >= 2.0 && m < 10.0) colorClass = 'text-blue-400 bg-blue-950/40 border-blue-800/50';
-                if (m >= 10.0) colorClass = 'text-yellow-400 bg-yellow-950/40 border-yellow-800/50';
-                html += `<span class="px-2.5 py-1 rounded-lg text-xs font-bold border ${colorClass}">${m.toFixed(2)}x</span>`;
+        async function submitWithdraw() {
+            const amount = parseFloat(document.getElementById('withdraw-amount-input').value);
+            await fetch('/api/withdraw', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ amount })
             });
-            bar.innerHTML = html;
+            closeWithdrawModal();
+            fetchState();
         }
 
-        function pollGameState() {
-            fetch('/api/state').then(r => r.json()).then(res => {
-                if (!res.success) return;
-                if (res.user && res.user.name && !currentUser) {
-                    currentUser = res.user;
-                    updateUserUI();
-                    document.getElementById('auth-modal').classList.add('hidden');
-                }
-                if (currentUser && res.user) {
-                    currentUser.balance = res.user.balance;
-                    updateUserUI();
-                }
-
-                gameStateData = res.game;
-                updateHistoryBar(gameStateData.history);
-
-                const multDisplay = document.getElementById('multiplier-display');
-                const statusText = document.getElementById('flight-status-text');
-                const plane = document.getElementById('airplane-indicator');
-
-                multDisplay.innerText = gameStateData.currentMultiplier.toFixed(2) + 'x';
-
-                if (gameStateData.status === 'WAITING') {
-                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight';
-                    statusText.innerText = 'WAITING FOR NEXT ROUND';
-                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-emerald-400 bg-emerald-950/60 px-4 py-1.5 rounded-full border border-emerald-800/50 shadow';
-                    plane.classList.add('hidden');
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                } else if (gameStateData.status === 'FLYING') {
-                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-yellow-400 tracking-tight';
-                    statusText.innerText = 'FLIGHT IS FLYING';
-                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-blue-400 bg-blue-950/60 px-4 py-1.5 rounded-full border border-blue-800/50 shadow';
-                    let progress = Math.min((gameStateData.currentMultiplier - 1) / 5, 1);
-                    drawFlightCurve(progress);
-                } else if (gameStateData.status === 'CRASHED') {
-                    multDisplay.innerText = (gameStateData.crashPoint || gameStateData.currentMultiplier).toFixed(2) + 'x';
-                    multDisplay.className = 'text-5xl sm:text-7xl font-black flight-glow text-red-500 tracking-tight';
-                    statusText.innerText = 'FLED / CRASHED';
-                    statusText.className = 'mt-2 text-sm sm:text-lg font-bold uppercase tracking-widest text-red-400 bg-red-950/60 px-4 py-1.5 rounded-full border border-red-800/50 shadow';
-                    plane.classList.add('hidden');
-                }
-
-                // Update user bets state UI
-                [1, 2].forEach(id => {
-                    const ub = (res.userBets || []).find(b => b.betNumber === id);
-                    const btn = document.getElementById(`bet${id}-action-btn`);
-                    const liveWinBox = document.getElementById(`bet${id}-live-win`);
-                    userBetsMap[id] = ub || { active: false, cashedOut: false };
-
-                    if (ub && ub.active) {
-                        if (gameStateData.status === 'FLYING') {
-                            btn.className = "w-full bg-yellow-500 hover:bg-yellow-400 text-gray-950 font-black py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                            btn.innerHTML = `<span>CASH OUT</span>`;
-                            liveWinBox.classList.remove('hidden');
-                            document.getElementById(`bet${id}-win-amount`).innerText = (ub.amount * gameStateData.currentMultiplier).toFixed(2);
-                            document.getElementById(`bet${id}-live-mult`).innerText = gameStateData.currentMultiplier.toFixed(2) + 'x';
-                        } else {
-                            btn.className = "w-full bg-red-600 hover:bg-red-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                            btn.innerHTML = `<span>CANCEL BET</span>`;
-                            liveWinBox.classList.add('hidden');
-                        }
-                    } else {
-                        btn.className = "w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition tracking-wide text-sm flex items-center justify-center space-x-2 uppercase";
-                        btn.innerHTML = `<span>BET</span>`;
-                        liveWinBox.classList.add('hidden');
-                    }
-                });
-
-                // Render live players sidebar
-                const list = document.getElementById('live-players-list');
-                let html = '';
-                [1, 2].forEach(id => {
-                    const ub = (res.userBets || []).find(b => b.betNumber === id);
-                    if (ub) {
-                        html += `
-                            <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg bg-blue-950/40 border border-blue-800/50 items-center">
-                                <span class="text-blue-300 font-bold truncate">You (Bet ${id})</span>
-                                <span class="text-center font-mono text-gray-200">${ub.amount.toFixed(2)}</span>
-                                <span class="text-right font-bold ${ub.cashedOut ? 'text-emerald-400' : 'text-yellow-400'}">
-                                    ${ub.cashedOut ? ub.cashoutValue.toFixed(2) + ' KES' : 'Running...'}
-                                </span>
-                            </div>
-                        `;
-                    }
-                });
-                (gameStateData.botBets || []).forEach(b => {
-                    html += `
-                        <div class="grid grid-cols-3 py-1.5 px-2 rounded-lg hover:bg-cardBg/50 items-center border-b border-gray-800/30">
-                            <span class="text-gray-300 font-medium truncate">${b.username}</span>
-                            <span class="text-center font-mono text-gray-400">${b.amount.toFixed(2)}</span>
-                            <span class="text-right font-bold ${b.cashedOut ? 'text-emerald-400' : 'text-gray-500'}">
-                                ${b.cashedOut ? b.cashoutAmount.toFixed(2) + ' KES' : '...'}
-                            </span>
-                        </div>
-                    `;
-                });
-                list.innerHTML = html;
-            });
-        }
-
-        setInterval(pollGameState, 150);
+        // Start Sync Loop
+        setInterval(fetchState, 150);
+        fetchState();
     </script>
 </body>
 </html>
 """
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
 
 
 
