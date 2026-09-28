@@ -287,7 +287,7 @@ def tick_game_locked():
 
     if GAME["status"] == "BETTING":
         elapsed = now - GAME["betting_start"]
-        GAME["current_multiplier"] = 1.50
+        GAME["current_multiplier"] = 0.5
         if elapsed >= BETTING_WINDOW:
             start_running_locked()
 
