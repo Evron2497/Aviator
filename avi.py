@@ -4945,8 +4945,6 @@
 #         debug=True
 #     )
 
-
-
 import os
 import time
 import random
@@ -5005,7 +5003,6 @@ def get_db():
     )
     conn.row_factory = sqlite3.Row
 
-    # Better concurrent read/write behavior.
     conn.execute("PRAGMA busy_timeout = 15000")
     conn.execute("PRAGMA journal_mode = WAL")
 
@@ -5109,9 +5106,6 @@ def init_db():
 # ============================================================
 
 def generate_crash_point():
-    """
-    Demo crash-point generator.
-    """
     value = random.random()
 
     if value < 0.05:
@@ -5130,9 +5124,6 @@ def generate_crash_point():
 
 
 def calculate_multiplier(elapsed):
-    """
-    Aggressive multiplier curve.
-    """
     multiplier = 1.0 + (elapsed * 1.20)
     if elapsed > 0.8:
         extra_time = elapsed - 0.8
@@ -5510,7 +5501,7 @@ def start_game_engine():
 
 
 # ============================================================
-# USER HELPERS & ROUTES (WITH EMBEDDED RESPONSIVE HTML)
+# USER HELPERS & ROUTES
 # ============================================================
 
 def get_user(username):
@@ -5766,7 +5757,7 @@ def manual_cashout(username, bet_number):
 
 
 # ============================================================
-# HTML TEMPLATE & FLASK APP ROUTES
+# HTML TEMPLATES & FLASK APP ROUTES
 # ============================================================
 
 HTML = """
@@ -5812,7 +5803,7 @@ HTML = """
             display: flex;
             align-items: center;
             flex-wrap: wrap;
-            gap: 4px;
+            gap: 6px;
             font-size: 19px;
             font-weight: 900;
             color: #28a745;
@@ -5827,16 +5818,36 @@ HTML = """
         .username-badge {
             display: inline-flex;
             align-items: center;
-            margin-left: 10px;
-            padding: 5px 10px;
-            border-radius: 14px;
+            margin-left: 6px;
+            padding: 4px 8px;
+            border-radius: 12px;
             background: #252830;
             border: 1px solid #343741;
             color: #ffffff;
             font-size: 13px;
             font-weight: 700;
             white-space: nowrap;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        }
+
+        .admin-preview-badge {
+            display: inline-flex;
+            align-items: center;
+            margin-left: 6px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            background: #3a1515;
+            border: 1px solid #ff4d4d;
+            color: #ff6b6b;
+            font-size: 12px;
+            font-weight: 800;
+            white-space: nowrap;
+            animation: pulse-admin 1.5s infinite;
+        }
+
+        @keyframes pulse-admin {
+            0% { opacity: 0.85; }
+            50% { opacity: 1; border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255, 77, 77, 0.4); }
+            100% { opacity: 0.85; }
         }
 
         .wallet {
@@ -5983,7 +5994,7 @@ HTML = """
 
         .btn-bet { background: #28a745; color: white; }
         .btn-cashout { background: #ffc107; color: #121316; }
-        .btn-waiting { background: #4a4d59; color: #white; cursor: not-allowed; }
+        .btn-waiting { background: #4a4d59; color: white; cursor: not-allowed; }
 
         .btn-title { font-size: 18px; }
         .btn-sub { font-size: 13px; opacity: 0.9; }
@@ -6024,7 +6035,8 @@ HTML = """
             body { overflow-x: hidden; }
             .header { padding: 8px 10px; align-items: flex-start; }
             .brand { font-size: 16px; flex-direction: column; align-items: flex-start; gap: 4px; }
-            .username-badge { margin-left: 0; font-size: 11px; padding: 4px 8px; }
+            .username-badge { margin-left: 0; font-size: 11px; padding: 3px 6px; }
+            .admin-preview-badge { margin-left: 0; font-size: 11px; padding: 3px 6px; }
             .wallet { gap: 5px; }
             .balance { font-size: 12px; }
             .deposit-btn, .withdraw-btn { padding: 7px 9px; font-size: 11px; }
@@ -6041,7 +6053,7 @@ HTML = """
 
         @media (max-width: 430px) {
             .header { flex-direction: column; align-items: stretch; }
-            .brand { flex-direction: row; justifyContent: space-between; align-items: center; width: 100%; }
+            .brand { flex-direction: row; justify-content: space-between; align-items: center; width: 100%; }
             .wallet { width: 100%; justify-content: space-between; flex-wrap: wrap; }
             .balance { font-size: 13px; }
             .stage { height: 225px; }
@@ -6060,6 +6072,9 @@ HTML = """
         <div class="brand">
             <span class="aviator-logo">✈ AVIATOR</span>
             <span class="username-badge">@{{ username }}</span>
+            {% if role == 'ADMIN' %}
+            <span class="admin-preview-badge" id="admin-next-badge">Next: Loading...</span>
+            {% endif %}
         </div>
         <div class="wallet">
             <span class="balance" id="user-balance">KES 0.00</span>
@@ -6136,6 +6151,7 @@ HTML = """
         let targetMult = 1.00;
         let currentMult = 1.00;
         let myBets = { 1: { status: 'NONE' }, 2: { status: 'NONE' } };
+        const isAdmin = {{ 'true' if role == 'ADMIN' else 'false' }};
 
         function resizeCanvas() {
             canvas.width = canvas.clientWidth;
@@ -6205,7 +6221,6 @@ HTML = """
 
             ctx.clearRect(0, 0, width, height);
 
-            // Draw flight trajectory curve / grid
             ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
             ctx.lineWidth = 1;
             for(let i=0; i<width; i+=40) {
@@ -6219,7 +6234,6 @@ HTML = """
             const endX = width * 0.15 + (width * 0.75 * progress);
             const endY = height * 0.85 - (height * 0.70 * progress);
 
-            // Flight path curve
             ctx.strokeStyle = "#ff3b30";
             ctx.lineWidth = 3;
             ctx.beginPath();
@@ -6282,6 +6296,13 @@ HTML = """
                 targetMult = Number(data.multiplier);
                 document.getElementById("user-balance").innerText = `KES ${data.balance.toFixed(2)}`;
 
+                if (isAdmin && data.next_crash) {
+                    const nextBadge = document.getElementById("admin-next-badge");
+                    if (nextBadge) {
+                        nextBadge.innerText = `Next: ${data.next_crash.toFixed(2)}x`;
+                    }
+                }
+
                 myBets = data.my_bets;
                 for(let slot of [1, 2]) {
                     const btn = document.getElementById(`action-btn-${slot}`);
@@ -6334,7 +6355,9 @@ HTML = """
 def index():
     if "username" not in session:
         return redirect("/login")
-    return render_template_string(HTML, username=session["username"])
+    user = get_user(session["username"])
+    role = user["role"] if user else "USER"
+    return render_template_string(HTML, username=session["username"], role=role)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -6344,7 +6367,7 @@ def login():
         password = request.form.get("password", "")
 
         user = get_user(username)
-        if user and verify_password(password, user["password"] if "password" in user else ""): # simplified login
+        if user and verify_password(password, user["password"] if "password" in user else ""):
             session["username"] = username
             return redirect("/")
         return render_template_string(LOGIN_HTML, error="Invalid credentials")
@@ -6362,8 +6385,10 @@ LOGIN_HTML = """
         body { background: #121316; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
         .card { background: #1b1c20; padding: 24px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #2a2b30; }
         input { width: 100%; padding: 10px; margin: 10px 0; background: #121316; border: 1px solid #343741; color: #fff; border-radius: 6px; }
-        button { width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        button { width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 5px; }
         .error { color: #dc3545; font-size: 13px; margin-bottom: 10px; }
+        .footer-text { text-align: center; margin-top: 15px; font-size: 13px; color: #aaa; }
+        .footer-text a { color: #28a745; text-decoration: none; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -6375,6 +6400,97 @@ LOGIN_HTML = """
             <input type="password" name="password" placeholder="Password" required>
             <button type="submit">Login</button>
         </form>
+        <div class="footer-text">
+            Don't have an account? <a href="/register">Register here</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        phone_number = request.form.get("phone_number", "").strip()
+
+        if not username or not password or not phone_number:
+            return render_template_string(REGISTER_HTML, error="All fields are required.")
+
+        conn = get_db()
+        try:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE username = ? OR phone_number = ?",
+                (username, phone_number)
+            ).fetchone()
+
+            if existing:
+                return render_template_string(REGISTER_HTML, error="Username or phone number already taken.")
+
+            conn.execute(
+                """
+                INSERT INTO users (
+                    username,
+                    password,
+                    phone_number,
+                    balance,
+                    role,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    hash_password(password),
+                    phone_number,
+                    STARTING_BALANCE,
+                    "USER",
+                    datetime.now().isoformat()
+                )
+            )
+            conn.commit()
+            session["username"] = username
+            return redirect("/")
+        except Exception as exc:
+            print("REGISTRATION ERROR:", repr(exc))
+            return render_template_string(REGISTER_HTML, error="Registration failed.")
+        finally:
+            conn.close()
+
+    return render_template_string(REGISTER_HTML, error=None)
+
+
+REGISTER_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register - Aviator</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { background: #121316; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: #1b1c20; padding: 24px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #2a2b30; }
+        input { width: 100%; padding: 10px; margin: 10px 0; background: #121316; border: 1px solid #343741; color: #fff; border-radius: 6px; }
+        button { width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 5px; }
+        .error { color: #dc3545; font-size: 13px; margin-bottom: 10px; }
+        .footer-text { text-align: center; margin-top: 15px; font-size: 13px; color: #aaa; }
+        .footer-text a { color: #28a745; text-decoration: none; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Create Account</h2>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="text" name="phone_number" placeholder="Phone Number (e.g., 2547...)" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Register</button>
+        </form>
+        <div class="footer-text">
+            Already have an account? <a href="/login">Login here</a>
+        </div>
     </div>
 </body>
 </html>
@@ -6440,12 +6556,14 @@ def api_state():
     username = session.get("username", "")
     user = get_user(username) if username else None
     balance = float(user["balance"]) if user else 0.0
+    is_admin = user and user["role"] == "ADMIN"
 
     with GAME_LOCK:
         tick_game_locked()
         status = GAME["status"]
         mult = GAME["current_multiplier"]
         round_id = GAME["round_id"]
+        next_crash = GAME["next_crash_point_1"] if is_admin else None
 
         my_bets = {1: {"status": "NONE"}, 2: {"status": "NONE"}}
         if username and round_id:
@@ -6477,6 +6595,7 @@ def api_state():
         "status": status,
         "multiplier": mult,
         "balance": balance,
+        "next_crash": next_crash,
         "my_bets": my_bets,
         "feed": feed
     })
