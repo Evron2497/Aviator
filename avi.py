@@ -5496,7 +5496,6 @@
 #     with GAME_LOCK:
 #         initialize_game()
 
-
 import os
 import time
 import random
@@ -5679,7 +5678,6 @@ def generate_crash_point():
 
 
 def calculate_multiplier(elapsed):
-    # Smooth, snappy acceleration curve (not too crazy, perfectly responsive)
     multiplier = 1.0 + (elapsed * 1.35)
     if elapsed > 0.7:
         extra_time = elapsed - 0.7
@@ -5730,37 +5728,6 @@ FAKE_USERS = [
 
 def generate_bot_bets():
     bets = []
-    
-    # 1. Fetch real active users for this round from the DB to appear on top
-    conn = get_db()
-    try:
-        real_bets_db = conn.execute(
-            """
-            SELECT username, amount, auto_cashout, status, cashout_multiplier, winnings
-            FROM bets
-            WHERE round_id = ?
-            """,
-            (GAME["round_id"],)
-        ).fetchall()
-
-        for b in real_bets_db:
-            # Mask or display real user usernames nicely, putting them at the top
-            bets.append({
-                "id": f"real_{b['username']}",
-                "username": b["username"],
-                "amount": b["amount"],
-                "auto_cashout": b["auto_cashout"],
-                "status": b["status"],
-                "cashout_multiplier": b["cashout_multiplier"],
-                "winnings": b["winnings"],
-                "is_real": True
-            })
-    except Exception as e:
-        print("Error fetching real bets:", e)
-    finally:
-        conn.close()
-
-    # 2. Generate random simulated bot bets to fill out the rest
     count = random.randint(30, 55)
     selected_users = random.choices(
         FAKE_USERS,
@@ -5792,7 +5759,6 @@ def generate_bot_bets():
             "status": "ACTIVE",
             "cashout_multiplier": None,
             "winnings": 0.0,
-            "is_real": False
         })
 
     return bets
@@ -6123,6 +6089,121 @@ def validate_amount(value):
     return round(amount, 2)
 
 
+def place_bet_for_user(username, bet_number, amount_val, auto_cashout_val):
+    amount = validate_amount(amount_val)
+    if not amount:
+        return False, "Invalid bet amount."
+
+    auto_cashout = None
+    if auto_cashout_val:
+        try:
+            auto_cashout = float(auto_cashout_val)
+            if auto_cashout < 1.01:
+                auto_cashout = None
+        except ValueError:
+            auto_cashout = None
+
+    with GAME_LOCK:
+        if GAME["status"] != "BETTING":
+            return False, "Betting is closed for this round."
+
+        conn = get_db()
+        try:
+            user = conn.execute(
+                "SELECT balance FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+
+            if not user or user["balance"] < amount:
+                return False, "Insufficient balance."
+
+            existing = conn.execute(
+                """
+                SELECT id FROM bets
+                WHERE username = ? AND round_id = ? AND bet_number = ?
+                """,
+                (username, GAME["round_id"], bet_number)
+            ).fetchone()
+
+            if existing:
+                return False, "Already placed a bet on this panel for this round."
+
+            conn.execute(
+                "UPDATE users SET balance = balance - ? WHERE username = ?",
+                (amount, username)
+            )
+
+            conn.execute(
+                """
+                INSERT INTO bets (
+                    username, round_id, bet_number, amount,
+                    auto_cashout, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?)
+                """,
+                (
+                    username,
+                    GAME["round_id"],
+                    bet_number,
+                    amount,
+                    auto_cashout,
+                    datetime.now().isoformat()
+                )
+            )
+            conn.commit()
+            return True, "Bet placed successfully."
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+
+def manual_cashout(username, bet_number):
+    with GAME_LOCK:
+        if GAME["status"] != "RUNNING":
+            return False, "Game is not currently running."
+
+        multiplier = GAME["current_multiplier"]
+        round_id = GAME["round_id"]
+
+        conn = get_db()
+        try:
+            bet = conn.execute(
+                """
+                SELECT id, amount FROM bets
+                WHERE username = ? AND round_id = ? AND bet_number = ? AND status = 'ACTIVE'
+                """,
+                (username, round_id, bet_number)
+            ).fetchone()
+
+            if not bet:
+                return False, "No active bet found to cash out."
+
+            winnings = round(float(bet["amount"]) * multiplier, 2)
+
+            cursor = conn.execute(
+                """
+                UPDATE bets
+                SET status = 'WON', cashout_multiplier = ?, winnings = ?
+                WHERE id = ? AND status = 'ACTIVE'
+                """,
+                (multiplier, winnings, bet["id"])
+            )
+
+            if cursor.rowcount == 1:
+                conn.execute(
+                    "UPDATE users SET balance = balance + ? WHERE username = ?",
+                    (winnings, username)
+                )
+                conn.commit()
+                return True, f"Cashed out at {multiplier}x successfully!"
+
+            return False, "Cashout failed."
+        finally:
+            conn.close()
+
+
 # ============================================================
 # FLASK APP ROUTES
 # ============================================================
@@ -6218,14 +6299,14 @@ def api_state():
 
         user_bets = {}
 
-        if username:
-            u = get_user(username)
-            if u:
-                user_balance = float(u["balance"])
-                user_role = u["role"]
+        conn = get_db()
+        try:
+            if username:
+                u = get_user(username)
+                if u:
+                    user_balance = float(u["balance"])
+                    user_role = u["role"]
 
-            conn = get_db()
-            try:
                 bets = conn.execute(
                     """
                     SELECT bet_number, amount, status, cashout_multiplier, winnings, auto_cashout
@@ -6243,8 +6324,28 @@ def api_state():
                         "winnings": b["winnings"],
                         "auto_cashout": b["auto_cashout"]
                     }
-            finally:
-                conn.close()
+
+            # Fetch all real user bets for the current round to show in active users list
+            real_active_bets = conn.execute(
+                """
+                SELECT username, amount, status, cashout_multiplier, winnings
+                FROM bets
+                WHERE round_id = ?
+                """,
+                (GAME["round_id"],)
+            ).fetchall()
+        finally:
+            conn.close()
+
+        formatted_real_bets = []
+        for rb in real_active_bets:
+            formatted_real_bets.append({
+                "username": rb["username"],
+                "amount": rb["amount"],
+                "status": rb["status"],
+                "cashout_multiplier": rb["cashout_multiplier"],
+                "winnings": rb["winnings"]
+            })
 
         admin_next = None
         if user_role == "ADMIN":
@@ -6259,7 +6360,8 @@ def api_state():
             "role": user_role,
             "admin_next": admin_next,
             "user_bets": user_bets,
-            "bot_bets": GAME["bot_bets"]
+            "bot_bets": GAME["bot_bets"],
+            "real_bets": formatted_real_bets
         })
 
 
@@ -6273,7 +6375,6 @@ def api_bet():
     amount = data.get("amount", 100)
     auto_cashout = data.get("auto_cashout")
 
-    # Place bet in DB
     success, msg = place_bet_for_user(session["username"], bet_number, amount, auto_cashout)
     return jsonify({"success": success, "message": msg})
 
@@ -6311,3 +6412,406 @@ def api_deposit_success():
         return jsonify({"success": True, "balance": user["balance"]})
     finally:
         conn.close()
+
+
+# ============================================================
+# HTML TEMPLATES
+# ============================================================
+
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Aviator Live</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #121316; color: #ffffff; min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }
+        .header { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #1b1c20; padding: 10px 15px; border-bottom: 1px solid #2a2b30; position: sticky; top: 0; z-index: 1000; }
+        .brand { display: flex; align-items: center; gap: 8px; font-size: 19px; font-weight: 900; color: #28a745; }
+        .username-badge { padding: 4px 8px; border-radius: 12px; background: #252830; border: 1px solid #343741; color: #fff; font-size: 13px; font-weight: 700; }
+        .admin-preview-badge { padding: 4px 10px; border-radius: 12px; background: #3a1515; border: 1px solid #ff4d4d; color: #ff6b6b; font-size: 12px; font-weight: 800; animation: pulse-admin 1.5s infinite; }
+        @keyframes pulse-admin { 0% { opacity: 0.85; } 50% { opacity: 1; border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255, 77, 77, 0.4); } 100% { opacity: 0.85; } }
+        .wallet { display: flex; align-items: center; gap: 10px; }
+        .balance { font-size: 15px; font-weight: 700; color: #4cd137; }
+        .deposit-btn, .logout-btn { background: #28a745; color: white; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; text-decoration: none; }
+        .logout-btn { background: #dc3545; }
+        
+        .main-layout { width: min(calc(100% - 20px), 1500px); margin: 0 auto; padding: 10px; display: grid; grid-template-columns: 280px 1fr; gap: 12px; flex-grow: 1; }
+        @media(max-width: 950px) { .main-layout { grid-template-columns: 1fr; } }
+
+        /* Active Users Sidebar */
+        .active-users-panel { background: #18191d; border: 1px solid #2a2c33; border-radius: 12px; display: flex; flex-direction: column; max-height: 520px; overflow: hidden; }
+        .panel-header { background: #202126; padding: 10px 12px; font-size: 13px; font-weight: 800; border-bottom: 1px solid #2f313a; display: flex; justify-content: space-between; align-items: center; color: #aaa; }
+        .users-list { overflow-y: auto; flex-grow: 1; padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+        .user-bet-card { background: #202126; padding: 8px 10px; border-radius: 6px; border: 1px solid #2f313a; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+        .ub-name { font-weight: 700; color: #ddd; }
+        .ub-amount { color: #aaa; font-weight: 600; }
+        .ub-status-won { color: #28a745; font-weight: 800; }
+        .ub-status-active { color: #ffc107; font-weight: 800; }
+        .ub-status-lost { color: #ff4d4d; }
+
+        .game-section { display: flex; flex-direction: column; }
+        .stage { position: relative; width: 100%; height: clamp(240px, 38vw, 380px); background: radial-gradient(circle at 10% 90%, #20081e 0%, #0d060e 100%); border-radius: 12px 12px 0 0; overflow: hidden; border: 1px solid #2a2c33; }
+        canvas { width: 100%; height: 100%; display: block; }
+        .multiplier-overlay { position: absolute; top: 42%; left: 50%; transform: translate(-50%, -50%); font-size: clamp(45px, 8vw, 85px); font-weight: 900; text-align: center; color: #fff; z-index: 10; text-shadow: 0 0 15px rgba(0,0,0,.8); }
+        .panels-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; background: #18191d; padding: 12px; border-radius: 0 0 12px 12px; border: 1px solid #2a2c33; border-top: none; }
+        .bet-box { background: #202126; border: 1px solid #2f313a; border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+        .controls-flex { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+        .amount-controls { display: flex; align-items: center; background: #141518; border: 1px solid #2f313a; border-radius: 6px; overflow: hidden; flex-grow: 1; }
+        .step-btn { background: #25262c; color: white; border: none; width: 34px; height: 34px; font-weight: 700; cursor: pointer; }
+        .amount-input { width: 100%; background: transparent; border: none; color: white; text-align: center; font-size: 16px; font-weight: 700; }
+        .action-btn { min-width: 140px; height: 75px; border: none; border-radius: 8px; font-weight: 900; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; text-transform: uppercase; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .btn-bet { background: #28a745; color: white; }
+        .btn-cashout { background: #ffc107; color: #121316; }
+        .btn-waiting { background: #4a4d59; color: white; cursor: not-allowed; }
+        .btn-title { font-size: 17px; }
+        .btn-sub { font-size: 12px; opacity: 0.9; }
+        .quick-bets { display: flex; gap: 4px; }
+        .q-btn { background: #2b2d35; border: none; color: white; padding: 4px; font-size: 11px; border-radius: 4px; cursor: pointer; flex-grow: 1; }
+        
+        /* Modal Overlay */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 2000; align-items: center; justify-content: center; }
+        .modal-content { background: #1b1c20; padding: 24px; border-radius: 12px; width: 90%; max-width: 380px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; text-align: center; }
+        .modal-content input { width: 100%; padding: 10px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; font-size: 16px; text-align: center; }
+        .modal-content button { padding: 10px; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; }
+        
+        @media (max-width: 768px) {
+            .panels-container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="brand">
+            <span>✈ AVIATOR</span>
+            <span class="username-badge">@{{ username }}</span>
+            {% if role == 'ADMIN' %}
+            <span class="admin-preview-badge" id="admin-next-badge">Next: Loading...</span>
+            {% endif %}
+        </div>
+        <div class="wallet">
+            <span class="balance" id="user-balance">KES {{ "%.2f"|format(balance) }}</span>
+            <button class="deposit-btn" onclick="openDepositModal()">Deposit</button>
+            <a href="/logout" class="logout-btn">Logout</a>
+        </div>
+    </div>
+
+    <div class="main-layout">
+        <!-- Active Players Panel Sidebar -->
+        <div class="active-users-panel">
+            <div class="panel-header">
+                <span>Active Players</span>
+                <span id="total-players-count">0</span>
+            </div>
+            <div class="users-list" id="active-users-list">
+                <!-- Rendered dynamically -->
+            </div>
+        </div>
+
+        <div class="game-section">
+            <div class="stage">
+                <div class="multiplier-overlay" id="multiplier-display">1.00x</div>
+                <canvas id="gameCanvas"></canvas>
+            </div>
+
+            <div class="panels-container">
+                <!-- Bet Panel 1 -->
+                <div class="bet-box">
+                    <div class="controls-flex">
+                        <div class="amount-controls">
+                            <button class="step-btn" onclick="adjustAmount(1, -50)">-</button>
+                            <input type="number" id="bet-amount-1" class="amount-input" value="100" min="10">
+                            <button class="step-btn" onclick="adjustAmount(1, 50)">+</button>
+                        </div>
+                        <button id="action-btn-1" class="action-btn btn-bet" onclick="handleBetAction(1)">
+                            <span class="btn-title" id="btn-title-1">BET</span>
+                            <span class="btn-sub" id="btn-sub-1">KES 100</span>
+                        </button>
+                    </div>
+                    <div class="quick-bets">
+                        <button class="q-btn" onclick="setBetAmount(1, 50)">50</button>
+                        <button class="q-btn" onclick="setBetAmount(1, 100)">100</button>
+                        <button class="q-btn" onclick="setBetAmount(1, 500)">500</button>
+                        <button class="q-btn" onclick="setBetAmount(1, 1000)">1000</button>
+                    </div>
+                </div>
+
+                <!-- Bet Panel 2 -->
+                <div class="bet-box">
+                    <div class="controls-flex">
+                        <div class="amount-controls">
+                            <button class="step-btn" onclick="adjustAmount(2, -50)">-</button>
+                            <input type="number" id="bet-amount-2" class="amount-input" value="100" min="10">
+                            <button class="step-btn" onclick="adjustAmount(2, 50)">+</button>
+                        </div>
+                        <button id="action-btn-2" class="action-btn btn-bet" onclick="handleBetAction(2)">
+                            <span class="btn-title" id="btn-title-2">BET</span>
+                            <span class="btn-sub" id="btn-sub-2">KES 100</span>
+                        </button>
+                    </div>
+                    <div class="quick-bets">
+                        <button class="q-btn" onclick="setBetAmount(2, 50)">50</button>
+                        <button class="q-btn" onclick="setBetAmount(2, 100)">100</button>
+                        <button class="q-btn" onclick="setBetAmount(2, 500)">500</button>
+                        <button class="q-btn" onclick="setBetAmount(2, 1000)">1000</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Deposit Modal -->
+    <div class="modal-overlay" id="depositModal">
+        <div class="modal-content">
+            <h3>Deposit Funds via Link</h3>
+            <p style="font-size:13px; color:#aaa;">Enter deposit amount and click proceed to open secure payment gateway.</p>
+            <input type="number" id="deposit-amount" value="500" min="50">
+            <button style="background:#28a745; color:white;" onclick="proceedDeposit()">Proceed to Pay</button>
+            <button style="background:#444; color:white;" onclick="closeDepositModal()">Cancel</button>
+        </div>
+    </div>
+
+    <script>
+        const DEPOSIT_GATEWAY_URL = "https://checkout.example.com/pay?amount=";
+
+        function openDepositModal() { document.getElementById('depositModal').style.display = 'flex'; }
+        function closeDepositModal() { document.getElementById('depositModal').style.display = 'none'; }
+
+        function proceedDeposit() {
+            const amt = document.getElementById('deposit-amount').value;
+            if(!amt || amt <= 0) return alert('Enter valid amount');
+
+            window.open(DEPOSIT_GATEWAY_URL + amt, '_blank');
+            closeDepositModal();
+
+            setTimeout(() => {
+                if(confirm("Did you successfully complete the payment via the external link? Click OK to update your balance.")) {
+                    fetch('/api/deposit-success', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({amount: parseFloat(amt)})
+                    }).then(res => res.json()).then(data => {
+                        if(data.success) {
+                            document.getElementById('user-balance').innerText = 'KES ' + data.balance.toFixed(2);
+                            alert("Deposit successful! Your balance has been updated.");
+                        }
+                    });
+                }
+            }, 3000);
+        }
+
+        function adjustAmount(slot, delta) {
+            const input = document.getElementById('bet-amount-' + slot);
+            let val = parseFloat(input.value) || 0;
+            val = Math.max(10, val + delta);
+            input.value = val;
+            updateButtonLabels(slot);
+        }
+
+        function setBetAmount(slot, val) {
+            document.getElementById('bet-amount-' + slot).value = val;
+            updateButtonLabels(slot);
+        }
+
+        function updateButtonLabels(slot) {
+            const val = document.getElementById('bet-amount-' + slot).value;
+            const sub = document.getElementById('btn-sub-' + slot);
+            if(sub && !sub.dataset.active) {
+                sub.innerText = 'KES ' + val;
+            }
+        }
+
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        let gameState = { status: 'BETTING', current_multiplier: 1.00, user_bets: {} };
+
+        function handleBetAction(slot) {
+            const betStatus = gameState.user_bets[slot]?.status;
+            
+            if (betStatus === 'ACTIVE') {
+                fetch('/api/cashout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({bet_number: slot})
+                }).then(res => res.json()).then(data => {
+                    if(!data.success) alert(data.message);
+                });
+            } else {
+                const amount = document.getElementById('bet-amount-' + slot).value;
+                fetch('/api/bet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({bet_number: slot, amount: parseFloat(amount)})
+                }).then(res => res.json()).then(data => {
+                    if(!data.success) alert(data.message);
+                });
+            }
+        }
+
+        function pollState() {
+            fetch('/api/state')
+                .then(res => res.json())
+                .then(data => {
+                    gameState = data;
+                    document.getElementById('user-balance').innerText = 'KES ' + data.balance.toFixed(2);
+                    document.getElementById('multiplier-display').innerText = data.current_multiplier.toFixed(2) + 'x';
+
+                    if(data.admin_next) {
+                        const badge = document.getElementById('admin-next-badge');
+                        if(badge) badge.innerText = 'Next: ' + data.admin_next.toFixed(2) + 'x';
+                    }
+
+                    // Render active users & bots in the sidebar
+                    const listContainer = document.getElementById('active-users-list');
+                    let allBets = [];
+                    if (data.bot_bets) allBets = allBets.concat(data.bot_bets);
+                    if (data.real_bets) allBets = allBets.concat(data.real_bets);
+                    
+                    document.getElementById('total-players-count').innerText = allBets.length;
+                    
+                    listContainer.innerHTML = '';
+                    allBets.forEach(b => {
+                        let statusHtml = '';
+                        if (b.status === 'WON') {
+                            statusHtml = `<span class="ub-status-won">${b.cashout_multiplier ? b.cashout_multiplier + 'x' : ''} KES ${b.winnings.toFixed(2)}</span>`;
+                        } else if (b.status === 'ACTIVE') {
+                            statusHtml = `<span class="ub-status-active">Playing</span>`;
+                        } else {
+                            statusHtml = `<span class="ub-status-lost">Crashed</span>`;
+                        }
+
+                        listContainer.innerHTML += `
+                            <div class="user-bet-card">
+                                <span class="ub-name">${b.username}</span>
+                                <span class="ub-amount">KES ${b.amount}</span>
+                                ${statusHtml}
+                            </div>
+                        `;
+                    });
+
+                    for(let slot = 1; slot <= 2; slot++) {
+                        const btn = document.getElementById('action-btn-' + slot);
+                        const title = document.getElementById('btn-title-' + slot);
+                        const sub = document.getElementById('btn-sub-' + slot);
+                        const bet = data.user_bets[slot];
+
+                        if(bet && bet.status === 'ACTIVE') {
+                            btn.className = 'action-btn btn-cashout';
+                            title.innerText = 'CASHOUT';
+                            sub.dataset.active = "true";
+                            const liveWin = bet.amount * data.current_multiplier;
+                            sub.innerText = 'KES ' + liveWin.toFixed(2);
+                        } else if(data.status === 'RUNNING' && bet && bet.status === 'WON') {
+                            btn.className = 'action-btn btn-waiting';
+                            title.innerText = 'WON';
+                            sub.dataset.active = "";
+                            sub.innerText = 'KES ' + bet.winnings.toFixed(2);
+                        } else if(data.status === 'BETTING') {
+                            btn.className = 'action-btn btn-bet';
+                            title.innerText = 'BET';
+                            sub.dataset.active = "";
+                            sub.innerText = 'KES ' + document.getElementById('bet-amount-' + slot).value;
+                        } else {
+                            btn.className = 'action-btn btn-waiting';
+                            title.innerText = data.status === 'RUNNING' ? 'STARTED' : 'CRASHED';
+                            sub.dataset.active = "";
+                            sub.innerText = bet ? (bet.status === 'WON' ? 'KES ' + bet.winnings.toFixed(2) : 'LOST') : 'WAITING';
+                        }
+                    }
+
+                    renderCanvas(data.current_multiplier, data.status);
+                }).catch(err => console.error(err));
+        }
+
+        function renderCanvas(multiplier, status) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.beginPath();
+            ctx.strokeStyle = status === 'CRASHED' ? '#ff4d4d' : '#28a745';
+            ctx.lineWidth = 4;
+
+            const progress = Math.min(1, (multiplier - 1) / 10);
+            const endX = canvas.width * 0.2 + progress * (canvas.width * 0.75);
+            const endY = canvas.height - (progress * (canvas.height * 0.75));
+
+            ctx.moveTo(0, canvas.height);
+            ctx.quadraticCurveTo(endX * 0.5, canvas.height * 0.9, endX, endY);
+            ctx.stroke();
+        }
+
+        setInterval(pollState, {{ CLIENT_POLL_MS }});
+    </script>
+</body>
+</html>
+"""
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Aviator Live</title>
+    <style>
+        body { background: #121316; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; }
+        .card { background: #1b1c20; padding: 30px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; }
+        input { width: 100%; padding: 12px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; }
+        button { background: #28a745; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .error { color: #ff6b6b; font-size: 13px; text-align: center; }
+        a { color: #28a745; text-decoration: none; font-size: 13px; text-align: center; }
+    </style>
+</head>
+<body>
+    <form class="card" method="POST">
+        <h2 style="text-align:center;">✈ AVIATOR LOGIN</h2>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Log In</button>
+        <a href="/register">Don't have an account? Register</a>
+    </form>
+</body>
+</html>
+"""
+
+REGISTER_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register - Aviator Live</title>
+    <style>
+        body { background: #121316; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; }
+        .card { background: #1b1c20; padding: 30px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; }
+        input { width: 100%; padding: 12px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; }
+        button { background: #28a745; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .error { color: #ff6b6b; font-size: 13px; text-align: center; }
+        a { color: #28a745; text-decoration: none; font-size: 13px; text-align: center; }
+    </style>
+</head>
+<body>
+    <form class="card" method="POST">
+        <h2 style="text-align:center;">✈ CREATE ACCOUNT</h2>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="text" name="phone_number" placeholder="Phone Number (e.g. 2547...)" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Register</button>
+        <a href="/login">Already have an account? Log in</a>
+    </form>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)
