@@ -4969,16 +4969,16 @@ from flask import (
 
 DB_NAME = "aviator_live.db"
 
-BETTING_WINDOW = 7.0
+BETTING_WINDOW = 6.0
 MAX_WITHDRAWAL = 250000.0
 CRASH_DISPLAY_TIME = 1.5
 STARTING_BALANCE = 0.0
 
 # Client polling interval in milliseconds.
-CLIENT_POLL_MS = 200
+CLIENT_POLL_MS = 150
 
-# Game engine tick.
-GAME_TICK = 0.05
+# Game engine tick (optimized for smooth and snappy flight).
+GAME_TICK = 0.04
 
 app = Flask(__name__)
 
@@ -5064,7 +5064,10 @@ def init_db():
             )
         """)
 
-        # Create admin account if missing.
+        # Create admin account securely from environment or default
+        admin_password_env = os.environ.get("ADMIN_PASSWORD", "admin123")
+        admin_phone_env = os.environ.get("ADMIN_PHONE", "254700000000")
+
         admin = conn.execute(
             "SELECT id FROM users WHERE username = ?",
             ("admin",)
@@ -5083,8 +5086,8 @@ def init_db():
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 "admin",
-                hash_password("admin123"),
-                "254700000000",
+                hash_password(admin_password_env),
+                admin_phone_env,
                 10000.0,
                 "ADMIN",
                 datetime.now().isoformat()
@@ -5124,10 +5127,11 @@ def generate_crash_point():
 
 
 def calculate_multiplier(elapsed):
-    multiplier = 1.0 + (elapsed * 1.20)
-    if elapsed > 0.8:
-        extra_time = elapsed - 0.8
-        multiplier += (extra_time ** 1.45) * 0.55
+    # Smooth, snappy acceleration curve (not too crazy, perfectly responsive)
+    multiplier = 1.0 + (elapsed * 1.35)
+    if elapsed > 0.7:
+        extra_time = elapsed - 0.7
+        multiplier += (extra_time ** 1.38) * 0.65
     return round(max(multiplier, 1.0), 2)
 
 
@@ -5174,7 +5178,7 @@ FAKE_USERS = [
 
 def generate_bot_bets():
     bets = []
-    count = random.randint(35, 65)
+    count = random.randint(30, 55)
     selected_users = random.choices(
         FAKE_USERS,
         k=count
@@ -5192,7 +5196,7 @@ def generate_bot_bets():
         )
 
         target_cashout = (
-            round(random.uniform(1.10, 6.00), 2)
+            round(random.uniform(1.10, 5.50), 2)
             if random.random() > 0.20
             else None
         )
@@ -5535,229 +5539,198 @@ def validate_amount(value):
     return round(amount, 2)
 
 
-def place_bet_for_user(
-    username,
-    bet_number,
-    amount,
-    auto_cashout
-):
-    with GAME_LOCK:
-        tick_game_locked()
+# ============================================================
+# FLASK APP ROUTES
+# ============================================================
 
-        if bet_number not in (1, 2):
-            return False, "Invalid bet slot."
+@app.route("/")
+def index():
+    if "username" not in session:
+        return redirect("/login")
+    
+    user = get_user(session["username"])
+    if not user:
+        session.clear()
+        return redirect("/login")
 
-        if GAME["status"] != "BETTING":
-            return False, "Betting closed for this round."
+    return render_template_string(
+        HTML,
+        username=user["username"],
+        role=user["role"],
+        balance=user["balance"]
+    )
 
-        amount = validate_amount(amount)
-        if amount is None:
-            return False, "Invalid amount."
 
-        if amount > MAX_WITHDRAWAL:
-            return False, "Amount is too large."
-
-        if auto_cashout in (None, "", False):
-            auto_cashout = None
-        else:
-            try:
-                auto_cashout = float(auto_cashout)
-            except (TypeError, ValueError):
-                return False, "Invalid auto cashout."
-
-            if auto_cashout < 1.01:
-                return False, "Auto cashout minimum is 1.01x."
-
-            auto_cashout = round(auto_cashout, 2)
+@app.route("/login", methods=["GET", "PRIN", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
 
         conn = get_db()
-
         try:
-            conn.execute("BEGIN IMMEDIATE")
-
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM bets
-                WHERE username = ?
-                  AND round_id = ?
-                  AND bet_number = ?
-                """,
-                (
-                    username,
-                    GAME["round_id"],
-                    bet_number
-                )
-            ).fetchone()
-
-            if existing:
-                conn.rollback()
-                return False, f"Bet {bet_number} already placed."
-
             user = conn.execute(
-                """
-                SELECT balance
-                FROM users
-                WHERE username = ?
-                """,
+                "SELECT * FROM users WHERE username = ?",
                 (username,)
             ).fetchone()
 
-            if not user or float(user["balance"]) < amount:
-                conn.rollback()
-                return False, "Insufficient balance."
-
-            cursor = conn.execute(
-                """
-                UPDATE users
-                SET balance = balance - ?
-                WHERE username = ?
-                  AND balance >= ?
-                """,
-                (
-                    amount,
-                    username,
-                    amount
-                )
-            )
-
-            if cursor.rowcount != 1:
-                conn.rollback()
-                return False, "Insufficient balance."
-
-            conn.execute(
-                """
-                INSERT INTO bets (
-                    username,
-                    round_id,
-                    bet_number,
-                    amount,
-                    auto_cashout,
-                    winnings,
-                    status,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    username,
-                    GAME["round_id"],
-                    bet_number,
-                    amount,
-                    auto_cashout,
-                    0.0,
-                    "ACTIVE",
-                    datetime.now().isoformat()
-                )
-            )
-
-            conn.commit()
-            return True, f"Bet {bet_number} placed."
-
-        except Exception as exc:
-            conn.rollback()
-            print("BET ERROR:", repr(exc))
-            return False, "Failed to place bet."
-
+            if user and verify_password(password, user["password"]):
+                session["username"] = user["username"]
+                return redirect("/")
         finally:
             conn.close()
 
+        return render_template_string(LOGIN_HTML, error="Invalid username or password.")
 
-def manual_cashout(username, bet_number):
+    return render_template_string(LOGIN_HTML, error=None)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        phone_number = request.form.get("phone_number", "").strip()
+        password = request.form.get("password", "").strip()
+
+        if not username or not phone_number or not password:
+            return render_template_string(REGISTER_HTML, error="All fields are required.")
+
+        conn = get_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO users (username, password, phone_number, balance, role, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (username, hash_password(password), phone_number, STARTING_BALANCE, "USER", datetime.now().isoformat())
+            )
+            conn.commit()
+            session["username"] = username
+            return redirect("/")
+        except sqlite3.IntegrityError:
+            return render_template_string(REGISTER_HTML, error="Username or phone number already exists.")
+        finally:
+            conn.close()
+
+    return render_template_string(REGISTER_HTML, error=None)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+@app.route("/api/state")
+def api_state():
+    start_game_engine()
+
     with GAME_LOCK:
         tick_game_locked()
 
-        if GAME["status"] != "RUNNING":
-            return False, "Flight not running."
+        username = session.get("username")
+        user_balance = 0.0
+        user_role = "USER"
 
-        multiplier = GAME["current_multiplier"]
-        crash_point = GAME["crash_point"]
+        user_bets = {}
 
-        if multiplier >= crash_point:
-            return False, "Round crashed."
+        if username:
+            u = get_user(username)
+            if u:
+                user_balance = float(u["balance"])
+                user_role = u["role"]
 
-        multiplier = round(multiplier, 2)
-        conn = get_db()
+            conn = get_db()
+            try:
+                bets = conn.execute(
+                    """
+                    SELECT bet_number, amount, status, cashout_multiplier, winnings, auto_cashout
+                    FROM bets
+                    WHERE username = ? AND round_id = ?
+                    """,
+                    (username, GAME["round_id"])
+                ).fetchall()
 
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+                for b in bets:
+                    user_bets[str(b["bet_number"])] = {
+                        "amount": b["amount"],
+                        "status": b["status"],
+                        "cashout_multiplier": b["cashout_multiplier"],
+                        "winnings": b["winnings"],
+                        "auto_cashout": b["auto_cashout"]
+                    }
+            finally:
+                conn.close()
 
-            bet = conn.execute(
-                """
-                SELECT *
-                FROM bets
-                WHERE username = ?
-                  AND round_id = ?
-                  AND bet_number = ?
-                  AND status = 'ACTIVE'
-                """,
-                (
-                    username,
-                    GAME["round_id"],
-                    bet_number
-                )
-            ).fetchone()
+        admin_next = None
+        if user_role == "ADMIN":
+            admin_next = GAME["crash_point"] if GAME["status"] == "CRASHED" else GAME["next_crash_point_1"]
 
-            if not bet:
-                conn.rollback()
-                return False, "No active bet found."
+        return jsonify({
+            "round_id": GAME["round_id"],
+            "status": GAME["status"],
+            "current_multiplier": GAME["current_multiplier"],
+            "crash_point": GAME["crash_point"] if GAME["status"] == "CRASHED" else None,
+            "balance": user_balance,
+            "role": user_role,
+            "admin_next": admin_next,
+            "user_bets": user_bets,
+            "bot_bets": GAME["bot_bets"]
+        })
 
-            winnings = round(
-                float(bet["amount"]) * multiplier,
-                2
-            )
 
-            cursor = conn.execute(
-                """
-                UPDATE bets
-                SET
-                    status = 'WON',
-                    cashout_multiplier = ?,
-                    winnings = ?
-                WHERE id = ?
-                  AND status = 'ACTIVE'
-                """,
-                (
-                    multiplier,
-                    winnings,
-                    bet["id"]
-                )
-            )
+@app.route("/api/bet", methods=["POST"])
+def api_bet():
+    if "username" not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
 
-            if cursor.rowcount != 1:
-                conn.rollback()
-                return False, "Cashout failed."
+    data = request.get_json() or {}
+    bet_number = int(data.get("bet_number", 1))
+    amount = data.get("amount", 100)
+    auto_cashout = data.get("auto_cashout")
 
-            conn.execute(
-                """
-                UPDATE users
-                SET balance = balance + ?
-                WHERE username = ?
-                """,
-                (
-                    winnings,
-                    username
-                )
-            )
+    success, msg = place_bet_for_user(session["username"], bet_number, amount, auto_cashout)
+    return jsonify({"success": success, "message": msg})
 
-            conn.commit()
-            return (
-                True,
-                f"Cashed out at {multiplier:.2f}x — "
-                f"KES {winnings:,.2f}"
-            )
 
-        except Exception as exc:
-            conn.rollback()
-            print("CASHOUT ERROR:", repr(exc))
-            return False, "Cashout error."
+@app.route("/api/cashout", methods=["POST"])
+def api_cashout():
+    if "username" not in session:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
 
-        finally:
-            conn.close()
+    data = request.get_json() or {}
+    bet_number = int(data.get("bet_number", 1))
+
+    success, msg = manual_cashout(session["username"], bet_number)
+    return jsonify({"success": success, "message": msg})
+
+
+@app.route("/api/deposit-success", methods=["POST"])
+def api_deposit_success():
+    """Endpoint called after successful deposit link payment to update balance"""
+    if "username" not in session:
+        return jsonify({"success": False}), 401
+    
+    data = request.get_json() or {}
+    amount = validate_amount(data.get("amount", 0))
+    if not amount or amount <= 0:
+        return jsonify({"success": False, "message": "Invalid deposit amount"})
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE username = ?",
+            (amount, session["username"])
+        )
+        conn.commit()
+        user = conn.execute("SELECT balance FROM users WHERE username = ?", (session["username"],)).fetchone()
+        return jsonify({"success": True, "balance": user["balance"]})
+    finally:
+        conn.close()
 
 
 # ============================================================
-# HTML TEMPLATES & FLASK APP ROUTES
+# HTML TEMPLATES & FLASK APP ROUTES (CONTINUED)
 # ============================================================
 
 HTML = """
@@ -5768,318 +5741,60 @@ HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Aviator Live</title>
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        }
-
-        body {
-            background-color: #121316;
-            color: #ffffff;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow-x: hidden;
-        }
-
-        .header {
-            width: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            background: #1b1c20;
-            padding: 10px max(12px, env(safe-area-inset-right)) 10px max(12px, env(safe-area-inset-left));
-            border-bottom: 1px solid #2a2b30;
-            position: sticky;
-            top: 0;
-            z-index: 1000;
-        }
-
-        .brand {
-            min-width: 0;
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 6px;
-            font-size: 19px;
-            font-weight: 900;
-            color: #28a745;
-            letter-spacing: 1px;
-        }
-
-        .aviator-logo {
-            display: inline-flex;
-            align-items: center;
-        }
-
-        .username-badge {
-            display: inline-flex;
-            align-items: center;
-            margin-left: 6px;
-            padding: 4px 8px;
-            border-radius: 12px;
-            background: #252830;
-            border: 1px solid #343741;
-            color: #ffffff;
-            font-size: 13px;
-            font-weight: 700;
-            white-space: nowrap;
-        }
-
-        .admin-preview-badge {
-            display: inline-flex;
-            align-items: center;
-            margin-left: 6px;
-            padding: 4px 10px;
-            border-radius: 12px;
-            background: #3a1515;
-            border: 1px solid #ff4d4d;
-            color: #ff6b6b;
-            font-size: 12px;
-            font-weight: 800;
-            white-space: nowrap;
-            animation: pulse-admin 1.5s infinite;
-        }
-
-        @keyframes pulse-admin {
-            0% { opacity: 0.85; }
-            50% { opacity: 1; border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255, 77, 77, 0.4); }
-            100% { opacity: 0.85; }
-        }
-
-        .wallet {
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 7px;
-            flex-shrink: 0;
-        }
-
-        .balance {
-            font-size: 14px;
-            font-weight: 700;
-            color: #4cd137;
-        }
-
-        .deposit-btn, .withdraw-btn {
-            background: #28a745;
-            color: white;
-            border: none;
-            padding: 7px 12px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 12px;
-            cursor: pointer;
-            text-decoration: none;
-        }
-
-        .main-layout {
-            width: min(calc(100% - 20px), 1500px);
-            margin: 0 auto;
-            padding: 10px;
-            display: flex;
-            flex-direction: column;
-            flex-grow: 1;
-        }
-
-        .stage {
-            position: relative;
-            width: 100%;
-            height: clamp(220px, 42vw, 480px);
-            min-height: 220px;
-            background: radial-gradient(circle at 10% 90%, #20081e 0%, #0d060e 100%);
-            border-radius: 12px 12px 0 0;
-            overflow: hidden;
-            border: 1px solid #2a2c33;
-        }
-
-        canvas {
-            width: 100%;
-            height: 100%;
-            display: block;
-        }
-
-        .multiplier-overlay {
-            position: absolute;
-            top: 42%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            font-size: clamp(38px, 7vw, 82px);
-            font-weight: 900;
-            text-align: center;
-            color: #fff;
-            z-index: 10;
-            text-shadow: 0 0 15px rgba(0,0,0,.8);
-            white-space: nowrap;
-            max-width: 95%;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .panels-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-            background: #18191d;
-            padding: 12px;
-            border-radius: 0 0 12px 12px;
-            border: 1px solid #2a2c33;
-            border-top: none;
-        }
-
-        .bet-box {
-            background: #202126;
-            border: 1px solid #2f313a;
-            border-radius: 8px;
-            padding: 12px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .controls-flex {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .amount-controls {
-            display: flex;
-            align-items: center;
-            background: #141518;
-            border: 1px solid #2f313a;
-            border-radius: 6px;
-            overflow: hidden;
-            flex-grow: 1;
-        }
-
-        .step-btn {
-            background: #25262c;
-            color: white;
-            border: none;
-            width: 32px;
-            height: 32px;
-            font-weight: 700;
-            cursor: pointer;
-        }
-
-        .amount-input {
-            width: 100%;
-            background: transparent;
-            border: none;
-            color: white;
-            text-align: center;
-            font-size: 16px;
-            font-weight: 700;
-        }
-
-        .action-btn {
-            min-width: 130px;
-            height: 80px;
-            border: none;
-            border-radius: 8px;
-            font-weight: 900;
-            cursor: pointer;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            text-transform: uppercase;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-        }
-
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #121316; color: #ffffff; min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }
+        .header { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #1b1c20; padding: 10px 15px; border-bottom: 1px solid #2a2b30; position: sticky; top: 0; z-index: 1000; }
+        .brand { display: flex; align-items: center; gap: 8px; font-size: 19px; font-weight: 900; color: #28a745; }
+        .username-badge { padding: 4px 8px; border-radius: 12px; background: #252830; border: 1px solid #343741; color: #fff; font-size: 13px; font-weight: 700; }
+        .admin-preview-badge { padding: 4px 10px; border-radius: 12px; background: #3a1515; border: 1px solid #ff4d4d; color: #ff6b6b; font-size: 12px; font-weight: 800; animation: pulse-admin 1.5s infinite; }
+        @keyframes pulse-admin { 0% { opacity: 0.85; } 50% { opacity: 1; border-color: #ff1a1a; box-shadow: 0 0 8px rgba(255, 77, 77, 0.4); } 100% { opacity: 0.85; } }
+        .wallet { display: flex; align-items: center; gap: 10px; }
+        .balance { font-size: 15px; font-weight: 700; color: #4cd137; }
+        .deposit-btn, .logout-btn { background: #28a745; color: white; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; text-decoration: none; }
+        .logout-btn { background: #dc3545; }
+        .main-layout { width: min(calc(100% - 20px), 1500px); margin: 0 auto; padding: 10px; display: flex; flex-direction: column; flex-grow: 1; }
+        .stage { position: relative; width: 100%; height: clamp(240px, 42vw, 420px); background: radial-gradient(circle at 10% 90%, #20081e 0%, #0d060e 100%); border-radius: 12px 12px 0 0; overflow: hidden; border: 1px solid #2a2c33; }
+        canvas { width: 100%; height: 100%; display: block; }
+        .multiplier-overlay { position: absolute; top: 42%; left: 50%; transform: translate(-50%, -50%); font-size: clamp(45px, 8vw, 85px); font-weight: 900; text-align: center; color: #fff; z-index: 10; text-shadow: 0 0 15px rgba(0,0,0,.8); }
+        .panels-container { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; background: #18191d; padding: 12px; border-radius: 0 0 12px 12px; border: 1px solid #2a2c33; border-top: none; }
+        .bet-box { background: #202126; border: 1px solid #2f313a; border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+        .controls-flex { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+        .amount-controls { display: flex; align-items: center; background: #141518; border: 1px solid #2f313a; border-radius: 6px; overflow: hidden; flex-grow: 1; }
+        .step-btn { background: #25262c; color: white; border: none; width: 34px; height: 34px; font-weight: 700; cursor: pointer; }
+        .amount-input { width: 100%; background: transparent; border: none; color: white; text-align: center; font-size: 16px; font-weight: 700; }
+        .action-btn { min-width: 140px; height: 75px; border: none; border-radius: 8px; font-weight: 900; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; text-transform: uppercase; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
         .btn-bet { background: #28a745; color: white; }
         .btn-cashout { background: #ffc107; color: #121316; }
         .btn-waiting { background: #4a4d59; color: white; cursor: not-allowed; }
-
-        .btn-title { font-size: 18px; }
-        .btn-sub { font-size: 13px; opacity: 0.9; }
-
-        .quick-bets {
-            display: flex;
-            gap: 4px;
-        }
-
-        .q-btn {
-            background: #2b2d35;
-            border: none;
-            color: white;
-            padding: 4px 8px;
-            font-size: 11px;
-            border-radius: 4px;
-            cursor: pointer;
-            flex-grow: 1;
-        }
-
-        .feed-section {
-            margin-top: 10px;
-            background: #18191d;
-            border: 1px solid #2a2c33;
-            border-radius: 8px;
-            padding: 10px;
-        }
-
-        .feed-row {
-            display: grid;
-            grid-template-columns: 1.2fr 0.8fr 1fr;
-            font-size: 12px;
-            padding: 4px 0;
-            border-bottom: 1px solid #22232a;
-        }
-
+        .btn-title { font-size: 17px; }
+        .btn-sub { font-size: 12px; opacity: 0.9; }
+        .quick-bets { display: flex; gap: 4px; }
+        .q-btn { background: #2b2d35; border: none; color: white; padding: 4px; font-size: 11px; border-radius: 4px; cursor: pointer; flex-grow: 1; }
+        
+        /* Modal Overlay */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 2000; align-items: center; justify-content: center; }
+        .modal-content { background: #1b1c20; padding: 24px; border-radius: 12px; width: 90%; max-width: 380px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; text-align: center; }
+        .modal-content input { width: 100%; padding: 10px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; font-size: 16px; text-align: center; }
+        .modal-content button { padding: 10px; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; }
+        
         @media (max-width: 768px) {
-            body { overflow-x: hidden; }
-            .header { padding: 8px 10px; align-items: flex-start; }
-            .brand { font-size: 16px; flex-direction: column; align-items: flex-start; gap: 4px; }
-            .username-badge { margin-left: 0; font-size: 11px; padding: 3px 6px; }
-            .admin-preview-badge { margin-left: 0; font-size: 11px; padding: 3px 6px; }
-            .wallet { gap: 5px; }
-            .balance { font-size: 12px; }
-            .deposit-btn, .withdraw-btn { padding: 7px 9px; font-size: 11px; }
-            .main-layout { width: 100%; padding: 6px max(6px, env(safe-area-inset-right)) 10px max(6px, env(safe-area-inset-left)); }
-            .stage { height: 250px; min-height: 220px; border-radius: 10px 10px 0 0; }
-            .panels-container { grid-template-columns: 1fr; gap: 8px; padding: 8px; }
-            .bet-box { padding: 9px; }
-            .action-btn { min-width: 120px; height: 76px; }
-            .btn-title { font-size: 16px; }
-            .btn-sub { font-size: 14px; }
-            .feed-section { margin-top: 8px; padding: 9px; }
-            .feed-row { grid-template-columns: 1.2fr 0.8fr 1fr; font-size: 11px; gap: 4px; }
-        }
-
-        @media (max-width: 430px) {
-            .header { flex-direction: column; align-items: stretch; }
-            .brand { flex-direction: row; justify-content: space-between; align-items: center; width: 100%; }
-            .wallet { width: 100%; justify-content: space-between; flex-wrap: wrap; }
-            .balance { font-size: 13px; }
-            .stage { height: 225px; }
-            .multiplier-overlay { font-size: 38px; }
-            .controls-flex { gap: 6px; }
-            .action-btn { min-width: 105px; height: 70px; }
-            .step-btn { width: 30px; height: 30px; }
-            .amount-input { font-size: 15px; }
-            .quick-bets { gap: 3px; }
-            .q-btn { font-size: 10px; padding: 5px 2px; }
+            .panels-container { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="brand">
-            <span class="aviator-logo">✈ AVIATOR</span>
+            <span>✈ AVIATOR</span>
             <span class="username-badge">@{{ username }}</span>
             {% if role == 'ADMIN' %}
             <span class="admin-preview-badge" id="admin-next-badge">Next: Loading...</span>
             {% endif %}
         </div>
         <div class="wallet">
-            <span class="balance" id="user-balance">KES 0.00</span>
-            <button class="deposit-btn" onclick="openDeposit()">Deposit</button>
-            <a href="/logout" class="withdraw-btn" style="background:#dc3545;">Logout</a>
+            <span class="balance" id="user-balance">KES {{ "%.2f"|format(balance) }}</span>
+            <button class="deposit-btn" onclick="openDepositModal()">Deposit</button>
+            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
 
@@ -6094,12 +5809,12 @@ HTML = """
             <div class="bet-box">
                 <div class="controls-flex">
                     <div class="amount-controls">
-                        <button class="step-btn" onclick="adjustAmount(1, -10)">-</button>
-                        <input type="number" id="bet-amount-1" class="amount-input" value="100" min="10" step="10">
-                        <button class="step-btn" onclick="adjustAmount(1, 10)">+</button>
+                        <button class="step-btn" onclick="adjustAmount(1, -50)">-</button>
+                        <input type="number" id="bet-amount-1" class="amount-input" value="100" min="10">
+                        <button class="step-btn" onclick="adjustAmount(1, 50)">+</button>
                     </div>
                     <button id="action-btn-1" class="action-btn btn-bet" onclick="handleBetAction(1)">
-                        <span class="btn-title">BET</span>
+                        <span class="btn-title" id="btn-title-1">BET</span>
                         <span class="btn-sub" id="btn-sub-1">KES 100</span>
                     </button>
                 </div>
@@ -6115,12 +5830,12 @@ HTML = """
             <div class="bet-box">
                 <div class="controls-flex">
                     <div class="amount-controls">
-                        <button class="step-btn" onclick="adjustAmount(2, -10)">-</button>
-                        <input type="number" id="bet-amount-2" class="amount-input" value="100" min="10" step="10">
-                        <button class="step-btn" onclick="adjustAmount(2, 10)">+</button>
+                        <button class="step-btn" onclick="adjustAmount(2, -50)">-</button>
+                        <input type="number" id="bet-amount-2" class="amount-input" value="100" min="10">
+                        <button class="step-btn" onclick="adjustAmount(2, 50)">+</button>
                     </div>
                     <button id="action-btn-2" class="action-btn btn-bet" onclick="handleBetAction(2)">
-                        <span class="btn-title">BET</span>
+                        <span class="btn-title" id="btn-title-2">BET</span>
                         <span class="btn-sub" id="btn-sub-2">KES 100</span>
                     </button>
                 </div>
@@ -6132,476 +5847,236 @@ HTML = """
                 </div>
             </div>
         </div>
+    </div>
 
-        <div class="feed-section">
-            <div class="feed-row" style="font-weight:700; color:#888;">
-                <span>User</span><span>Bet</span><span>Multiplier</span>
-            </div>
-            <div id="live-feed">
-                <!-- Live bets feed -->
-            </div>
+    <!-- Deposit Modal -->
+    <div class="modal-overlay" id="depositModal">
+        <div class="modal-content">
+            <h3>Deposit Funds via Link</h3>
+            <p style="font-size:13px; color:#aaa;">Enter deposit amount and click proceed to open secure payment gateway.</p>
+            <input type="number" id="deposit-amount" value="500" min="50">
+            <button style="background:#28a745; color:white;" onclick="proceedDeposit()">Proceed to Pay</button>
+            <button style="background:#444; color:white;" onclick="closeDepositModal()">Cancel</button>
         </div>
     </div>
 
     <script>
-        const canvas = document.getElementById("gameCanvas");
-        const ctx = canvas.getContext("2d");
+        const DEPOSIT_GATEWAY_URL = "https://checkout.example.com/pay?amount="; // Replace with your live payment link gateway
 
-        let currentStatus = "BETTING";
-        let targetMult = 1.00;
-        let currentMult = 1.00;
-        let myBets = { 1: { status: 'NONE' }, 2: { status: 'NONE' } };
-        const isAdmin = {{ 'true' if role == 'ADMIN' else 'false' }};
+        function openDepositModal() { document.getElementById('depositModal').style.display = 'flex'; }
+        function closeDepositModal() { document.getElementById('depositModal').style.display = 'none'; }
 
-        function resizeCanvas() {
-            canvas.width = canvas.clientWidth;
-            canvas.height = canvas.clientHeight;
+        function proceedDeposit() {
+            const amt = document.getElementById('deposit-amount').value;
+            if(!amt || amt <= 0) return alert('Enter valid amount');
+
+            // Open secure link in new tab
+            window.open(DEPOSIT_GATEWAY_URL + amt, '_blank');
+            closeDepositModal();
+
+            // Simulate successful response / callback listener
+            setTimeout(() => {
+                if(confirm("Did you successfully complete the payment via the external link? Click OK to update your balance.")) {
+                    fetch('/api/deposit-success', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({amount: parseFloat(amt)})
+                    }).then(res => res.json()).then(data => {
+                        if(data.success) {
+                            document.getElementById('user-balance').innerText = 'KES ' + data.balance.toFixed(2);
+                            alert("Deposit successful! Your balance has been updated.");
+                        }
+                    });
+                }
+            }, 3000);
         }
-        window.addEventListener("resize", resizeCanvas);
-        resizeCanvas();
 
         function adjustAmount(slot, delta) {
-            const input = document.getElementById(`bet-amount-${slot}`);
+            const input = document.getElementById('bet-amount-' + slot);
             let val = parseFloat(input.value) || 0;
             val = Math.max(10, val + delta);
             input.value = val;
-            document.getElementById(`btn-sub-${slot}`).innerText = `KES ${val}`;
+            updateButtonLabels(slot);
         }
 
         function setBetAmount(slot, val) {
-            document.getElementById(`bet-amount-${slot}`).value = val;
-            document.getElementById(`btn-sub-${slot}`).innerText = `KES ${val}`;
+            document.getElementById('bet-amount-' + slot).value = val;
+            updateButtonLabels(slot);
         }
 
-        function openDeposit() {
-            const amt = prompt("Enter deposit amount (KES):", "1000");
-            if (!amt) return;
-            fetch("/deposit", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ amount: parseFloat(amt) })
-            }).then(r => r.json()).then(res => {
-                if(res.success) {
-                    document.getElementById("user-balance").innerText = `KES ${res.balance.toFixed(2)}`;
-                } else {
-                    alert(res.message);
-                }
-            });
+        function updateButtonLabels(slot) {
+            const val = document.getElementById('bet-amount-' + slot).value;
+            const sub = document.getElementById('btn-sub-' + slot);
+            if(sub && !sub.dataset.active) {
+                sub.innerText = 'KES ' + val;
+            }
         }
+
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        let gameState = { status: 'BETTING', current_multiplier: 1.00, user_bets: {} };
 
         function handleBetAction(slot) {
-            const amount = document.getElementById(`bet-amount-${slot}`).value;
-            const state = myBets[slot].status;
-
-            if (state === 'NONE' || state === 'LOST' || state === 'WON') {
-                fetch("/api/bet", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ bet_number: slot, amount: amount })
-                }).then(r => r.json()).then(res => {
-                    if(!res.success) alert(res.message);
-                    syncState();
+            const betStatus = gameState.user_bets[slot]?.status;
+            
+            if (betStatus === 'ACTIVE') {
+                // Manual Cashout
+                fetch('/api/cashout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({bet_number: slot})
+                }).then(res => res.json()).then(data => {
+                    if(!data.success) alert(data.message);
                 });
-            } else if (state === 'ACTIVE') {
-                fetch("/api/cashout", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ bet_number: slot })
-                }).then(r => r.json()).then(res => {
-                    if(!res.success) alert(res.message);
-                    syncState();
+            } else {
+                // Place Bet
+                const amount = document.getElementById('bet-amount-' + slot).value;
+                fetch('/api/bet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({bet_number: slot, amount: parseFloat(amount)})
+                }).then(res => res.json()).then(data => {
+                    if(!data.success) alert(data.message);
                 });
             }
         }
 
-        function drawScene() {
-            currentMult += (targetMult - currentMult) * 0.35;
-            const width = canvas.clientWidth;
-            const height = canvas.clientHeight;
+        function pollState() {
+            fetch('/api/state')
+                .then(res => res.json())
+                .then(data => {
+                    gameState = data;
+                    document.getElementById('user-balance').innerText = 'KES ' + data.balance.toFixed(2);
+                    document.getElementById('multiplier-display').innerText = data.current_multiplier.toFixed(2) + 'x';
 
-            ctx.clearRect(0, 0, width, height);
+                    if(data.admin_next) {
+                        const badge = document.getElementById('admin-next-badge');
+                        if(badge) badge.innerText = 'Next: ' + data.admin_next.toFixed(2) + 'x';
+                    }
 
-            ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
-            ctx.lineWidth = 1;
-            for(let i=0; i<width; i+=40) {
-                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, height); ctx.stroke();
-            }
-            for(let j=0; j<height; j+=40) {
-                ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(width, j); ctx.stroke();
-            }
+                    for(let slot = 1; slot <= 2; slot++) {
+                        const btn = document.getElementById('action-btn-' + slot);
+                        const title = document.getElementById('btn-title-' + slot);
+                        const sub = document.getElementById('btn-sub-' + slot);
+                        const bet = data.user_bets[slot];
 
-            const progress = Math.min(Math.max(Math.log(currentMult) / Math.log(8), 0), 1);
-            const endX = width * 0.15 + (width * 0.75 * progress);
-            const endY = height * 0.85 - (height * 0.70 * progress);
+                        if(bet && bet.status === 'ACTIVE') {
+                            btn.className = 'action-btn btn-cashout';
+                            title.innerText = 'CASHOUT';
+                            sub.dataset.active = "true";
+                            // Live runtime cashout amount calculation displayed on button
+                            const liveWin = bet.amount * data.current_multiplier;
+                            sub.innerText = 'KES ' + liveWin.toFixed(2);
+                        } else if(data.status === 'RUNNING' && bet && bet.status === 'WON') {
+                            btn.className = 'action-btn btn-waiting';
+                            title.innerText = 'WON';
+                            sub.dataset.active = "";
+                            sub.innerText = 'KES ' + bet.winnings.toFixed(2);
+                        } else if(data.status === 'BETTING') {
+                            btn.className = 'action-btn btn-bet';
+                            title.innerText = 'BET';
+                            sub.dataset.active = "";
+                            sub.innerText = 'KES ' + document.getElementById('bet-amount-' + slot).value;
+                        } else {
+                            btn.className = 'action-btn btn-waiting';
+                            title.innerText = data.status === 'RUNNING' ? 'STARTED' : 'CRASHED';
+                            sub.dataset.active = "";
+                            sub.innerText = bet ? (bet.status === 'WON' ? 'KES ' + bet.winnings.toFixed(2) : 'LOST') : 'WAITING';
+                        }
+                    }
 
-            ctx.strokeStyle = "#ff3b30";
-            ctx.lineWidth = 3;
+                    renderCanvas(data.current_multiplier, data.status);
+                }).catch(err => console.error(err));
+        }
+
+        function renderCanvas(multiplier, status) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Draw smooth animated flight curve
             ctx.beginPath();
-            ctx.moveTo(0, height);
-            ctx.quadraticCurveTo(width * 0.4, height * 0.9, endX, endY);
+            ctx.strokeStyle = status === 'CRASHED' ? '#ff4d4d' : '#28a745';
+            ctx.lineWidth = 4;
+
+            const progress = Math.min(1, (multiplier - 1) / 10);
+            const endX = canvas.width * 0.2 + progress * (canvas.width * 0.75);
+            const endY = canvas.height - (progress * (canvas.height * 0.75));
+
+            ctx.moveTo(0, canvas.height);
+            ctx.quadraticCurveTo(endX * 0.5, canvas.height * 0.9, endX, endY);
             ctx.stroke();
-
-            /* AIRCRAFT */
-            if (currentStatus === "RUNNING") {
-                ctx.save();
-                ctx.translate(endX, endY);
-
-                const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, 28);
-                glow.addColorStop(0, "rgba(255,80,80,0.9)");
-                glow.addColorStop(1, "rgba(255,40,40,0)");
-                ctx.fillStyle = glow;
-                ctx.beginPath();
-                ctx.arc(0, 0, 28, 0, Math.PI * 2);
-                ctx.fill();
-
-                const trail = ctx.createLinearGradient(-90, 0, 5, 0);
-                trail.addColorStop(0, "rgba(229,62,62,0)");
-                trail.addColorStop(1, "rgba(229,62,62,0.85)");
-                ctx.fillStyle = trail;
-                ctx.beginPath();
-                ctx.moveTo(-90, 0);
-                ctx.lineTo(-8, -5);
-                ctx.lineTo(-8, 5);
-                ctx.closePath();
-                ctx.fill();
-
-                ctx.fillStyle = "#ff3b30";
-                ctx.beginPath();
-                ctx.moveTo(14, 0);
-                ctx.lineTo(-8, -7);
-                ctx.lineTo(-4, -2);
-                ctx.lineTo(-17, -2);
-                ctx.lineTo(-20, -6);
-                ctx.lineTo(-22, -5);
-                ctx.lineTo(-15, 0);
-                ctx.lineTo(-22, 5);
-                ctx.lineTo(-20, 6);
-                ctx.lineTo(-17, 2);
-                ctx.lineTo(-4, 2);
-                ctx.lineTo(-8, 7);
-                ctx.closePath();
-                ctx.fill();
-
-                ctx.restore();
-            }
-
-            document.getElementById("multiplier-display").innerText = currentMult.toFixed(2) + "x";
-            requestAnimationFrame(drawScene);
-        }
-        requestAnimationFrame(drawScene);
-
-        function syncState() {
-            fetch("/api/state").then(r => r.json()).then(data => {
-                currentStatus = data.status;
-                targetMult = Number(data.multiplier);
-                document.getElementById("user-balance").innerText = `KES ${data.balance.toFixed(2)}`;
-
-                if (isAdmin && data.next_crash) {
-                    const nextBadge = document.getElementById("admin-next-badge");
-                    if (nextBadge) {
-                        nextBadge.innerText = `Next: ${data.next_crash.toFixed(2)}x`;
-                    }
-                }
-
-                myBets = data.my_bets;
-                for(let slot of [1, 2]) {
-                    const btn = document.getElementById(`action-btn-${slot}`);
-                    const sub = document.getElementById(`btn-sub-${slot}`);
-                    const status = myBets[slot].status;
-
-                    if (currentStatus === "BETTING") {
-                        if (status === 'ACTIVE') {
-                            btn.className = "action-btn btn-waiting";
-                            sub.innerText = "WAITING";
-                        } else {
-                            btn.className = "action-btn btn-bet";
-                            sub.innerText = `KES ${document.getElementById(`bet-amount-${slot}`).value}`;
-                        }
-                    } else if (currentStatus === "RUNNING") {
-                        if (status === 'ACTIVE') {
-                            btn.className = "action-btn btn-cashout";
-                            sub.innerText = "CASHOUT";
-                        } else {
-                            btn.className = "action-btn btn-waiting";
-                            sub.innerText = "RUNNING";
-                        }
-                    } else {
-                        btn.className = "action-btn btn-bet";
-                        sub.innerText = `KES ${document.getElementById(`bet-amount-${slot}`).value}`;
-                    }
-                }
-
-                const feed = document.getElementById("live-feed");
-                feed.innerHTML = "";
-                if(data.feed) {
-                    data.feed.forEach(f => {
-                        const row = document.createElement("div");
-                        row.className = "feed-row";
-                        row.innerHTML = `<span>${f.username}</span><span>KES ${f.amount}</span><span style="color:${f.status==='WON'?'#4cd137':'#fff'}">${f.status==='WON'?f.mult+'x':f.status}</span>`;
-                        feed.appendChild(row);
-                    });
-                }
-            });
         }
 
-        setInterval(syncState, 200);
+        setInterval(pollState, {{ CLIENT_POLL_MS }});
     </script>
 </body>
 </html>
 """
 
-
-@app.route("/")
-def index():
-    if "username" not in session:
-        return redirect("/login")
-    user = get_user(session["username"])
-    role = user["role"] if user else "USER"
-    return render_template_string(HTML, username=session["username"], role=role)
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-
-        user = get_user(username)
-        if user and verify_password(password, user["password"] if "password" in user else ""):
-            session["username"] = username
-            return redirect("/")
-        return render_template_string(LOGIN_HTML, error="Invalid credentials")
-
-    return render_template_string(LOGIN_HTML, error=None)
-
-
 LOGIN_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Login - Aviator</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Aviator Live</title>
     <style>
-        body { background: #121316; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: #1b1c20; padding: 24px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #2a2b30; }
-        input { width: 100%; padding: 10px; margin: 10px 0; background: #121316; border: 1px solid #343741; color: #fff; border-radius: 6px; }
-        button { width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 5px; }
-        .error { color: #dc3545; font-size: 13px; margin-bottom: 10px; }
-        .footer-text { text-align: center; margin-top: 15px; font-size: 13px; color: #aaa; }
-        .footer-text a { color: #28a745; text-decoration: none; font-weight: bold; }
+        body { background: #121316; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; }
+        .card { background: #1b1c20; padding: 30px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; }
+        input { width: 100%; padding: 12px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; }
+        button { background: #28a745; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .error { color: #ff6b6b; font-size: 13px; text-align: center; }
+        a { color: #28a745; text-decoration: none; font-size: 13px; text-align: center; }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h2>Aviator Login</h2>
+    <form class="card" method="POST">
+        <h2 style="text-align:center;">✈ AVIATOR LOGIN</h2>
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
-        <div class="footer-text">
-            Don't have an account? <a href="/register">Register here</a>
-        </div>
-    </div>
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Log In</button>
+        <a href="/register">Don't have an account? Register</a>
+    </form>
 </body>
 </html>
 """
-
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        phone_number = request.form.get("phone_number", "").strip()
-
-        if not username or not password or not phone_number:
-            return render_template_string(REGISTER_HTML, error="All fields are required.")
-
-        conn = get_db()
-        try:
-            existing = conn.execute(
-                "SELECT id FROM users WHERE username = ? OR phone_number = ?",
-                (username, phone_number)
-            ).fetchone()
-
-            if existing:
-                return render_template_string(REGISTER_HTML, error="Username or phone number already taken.")
-
-            conn.execute(
-                """
-                INSERT INTO users (
-                    username,
-                    password,
-                    phone_number,
-                    balance,
-                    role,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    username,
-                    hash_password(password),
-                    phone_number,
-                    STARTING_BALANCE,
-                    "USER",
-                    datetime.now().isoformat()
-                )
-            )
-            conn.commit()
-            session["username"] = username
-            return redirect("/")
-        except Exception as exc:
-            print("REGISTRATION ERROR:", repr(exc))
-            return render_template_string(REGISTER_HTML, error="Registration failed.")
-        finally:
-            conn.close()
-
-    return render_template_string(REGISTER_HTML, error=None)
-
 
 REGISTER_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Register - Aviator</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register - Aviator Live</title>
     <style>
-        body { background: #121316; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: #1b1c20; padding: 24px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #2a2b30; }
-        input { width: 100%; padding: 10px; margin: 10px 0; background: #121316; border: 1px solid #343741; color: #fff; border-radius: 6px; }
-        button { width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 5px; }
-        .error { color: #dc3545; font-size: 13px; margin-bottom: 10px; }
-        .footer-text { text-align: center; margin-top: 15px; font-size: 13px; color: #aaa; }
-        .footer-text a { color: #28a745; text-decoration: none; font-weight: bold; }
+        body { background: #121316; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; }
+        .card { background: #1b1c20; padding: 30px; border-radius: 12px; width: 100%; max-width: 360px; border: 1px solid #333; display: flex; flex-direction: column; gap: 14px; }
+        input { width: 100%; padding: 12px; background: #121316; border: 1px solid #333; color: white; border-radius: 6px; }
+        button { background: #28a745; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .error { color: #ff6b6b; font-size: 13px; text-align: center; }
+        a { color: #28a745; text-decoration: none; font-size: 13px; text-align: center; }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h2>Create Account</h2>
+    <form class="card" method="POST">
+        <h2 style="text-align:center;">✈ CREATE ACCOUNT</h2>
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="text" name="phone_number" placeholder="Phone Number (e.g., 2547...)" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Register</button>
-        </form>
-        <div class="footer-text">
-            Already have an account? <a href="/login">Login here</a>
-        </div>
-    </div>
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="text" name="phone_number" placeholder="Phone Number (e.g. 2547...)" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Register</button>
+        <a href="/login">Already have an account? Log in</a>
+    </form>
 </body>
 </html>
 """
 
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
-
-
-@app.route("/deposit", methods=["POST"])
-def deposit():
-    if "username" not in session:
-        return jsonify({"success": False, "message": "Unauthorized"})
-    data = request.get_json()
-    amount = validate_amount(data.get("amount"))
-    if not amount:
-        return jsonify({"success": False, "message": "Invalid amount"})
-
-    conn = get_db()
-    try:
-        conn.execute(
-            "UPDATE users SET balance = balance + ? WHERE username = ?",
-            (amount, session["username"])
-        )
-        conn.commit()
-        user = get_user(session["username"])
-        return jsonify({"success": True, "balance": float(user["balance"])})
-    finally:
-        conn.close()
-
-
-@app.route("/api/bet", methods=["POST"])
-def api_bet():
-    if "username" not in session:
-        return jsonify({"success": False, "message": "Unauthorized"})
-    data = request.get_json()
-    success, msg = place_bet_for_user(
-        session["username"],
-        int(data.get("bet_number", 1)),
-        data.get("amount"),
-        None
-    )
-    return jsonify({"success": success, "message": msg})
-
-
-@app.route("/api/cashout", methods=["POST"])
-def api_cashout():
-    if "username" not in session:
-        return jsonify({"success": False, "message": "Unauthorized"})
-    data = request.get_json()
-    success, msg = manual_cashout(
-        session["username"],
-        int(data.get("bet_number", 1))
-    )
-    return jsonify({"success": success, "message": msg})
-
-
-@app.route("/api/state")
-def api_state():
-    username = session.get("username", "")
-    user = get_user(username) if username else None
-    balance = float(user["balance"]) if user else 0.0
-    is_admin = user and user["role"] == "ADMIN"
-
-    with GAME_LOCK:
-        tick_game_locked()
-        status = GAME["status"]
-        mult = GAME["current_multiplier"]
-        round_id = GAME["round_id"]
-        next_crash = GAME["next_crash_point_1"] if is_admin else None
-
-        my_bets = {1: {"status": "NONE"}, 2: {"status": "NONE"}}
-        if username and round_id:
-            conn = get_db()
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT bet_number, status
-                    FROM bets
-                    WHERE username = ? AND round_id = ?
-                    """,
-                    (username, round_id)
-                ).fetchall()
-                for r in rows:
-                    my_bets[r["bet_number"]] = {"status": r["status"]}
-            finally:
-                conn.close()
-
-        feed = []
-        for b in GAME["bot_bets"][:10]:
-            feed.append({
-                "username": b["username"],
-                "amount": b["amount"],
-                "status": b["status"],
-                "mult": b["cashout_multiplier"] or 0.0
-            })
-
-    return jsonify({
-        "status": status,
-        "multiplier": mult,
-        "balance": balance,
-        "next_crash": next_crash,
-        "my_bets": my_bets,
-        "feed": feed
-    })
-
-
 if __name__ == "__main__":
-    start_game_engine()
+    init_db()
     app.run(host="0.0.0.0", port=5000, debug=True)
-
